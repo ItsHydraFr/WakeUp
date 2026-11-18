@@ -1,8 +1,13 @@
 package com.neo.wakeup
 
-import android.animation.ObjectAnimator
-import android.animation.PropertyValuesHolder
-import android.animation.ValueAnimator
+import android.animation.*
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Path
+import android.view.animation.DecelerateInterpolator
 import android.app.*
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
@@ -62,21 +67,6 @@ val THEMES = listOf(
     Th("Slate", "#14181F", "#2B3442", "#7C93FF", "#5ED3F3", "#E8EDF5", "#8FA0B8", "#26FFFFFF", "#14181F", true)
 )
 
-// card: 0 fill, 1 glass, 2 outline, 3 hard shadow, 4 soft raised, 5 hairline
-// btn: 0 gradient pill, 1 glass, 2 outline, 3 hard shadow, 4 bubbly 3D, 5 soft raised, 6 editorial
-// big: 0 gradient circle, 1 hard square, 2 glass circle, 3 terminal box, 4 soft circle, 5 line circle, 6 bubbly circle
-// fmt: 0 normal, 1 caps, 2 [ BRACKETS ], 3 spaced caps
-class Sty(val name: String, val font: String, val bold: String, val card: Int, val rad: Int, val btn: Int, val big: Int,
-          val fmt: Int, val flat: Boolean, val pulse: Boolean, val spacing: Float)
-val STYLES = listOf(
-    Sty("Modern", "sans-serif", "sans-serif-medium", 0, 24, 0, 0, 0, false, true, 0f),
-    Sty("Glass", "sans-serif-light", "sans-serif", 1, 30, 1, 2, 0, false, true, 0.02f),
-    Sty("Soft", "sans-serif-light", "sans-serif-medium", 4, 32, 5, 4, 0, false, false, 0f),
-    Sty("Brutal", "sans-serif-black", "sans-serif-black", 3, 6, 3, 1, 1, true, false, 0.04f),
-    Sty("Terminal", "monospace", "monospace", 2, 0, 2, 3, 2, true, false, 0f),
-    Sty("Editorial", "serif", "serif", 5, 2, 6, 5, 3, true, false, 0.12f),
-    Sty("Bubbly", "sans-serif-black", "sans-serif-black", 0, 36, 4, 6, 0, false, true, 0f)
-)
 
 // ---------- Core ----------
 object Core {
@@ -111,6 +101,7 @@ object Core {
         Thread {
             var ok = false
             try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) {}
+            log(c, 0, describe(o) + if (ok) "" else " (failed)")
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
     }
@@ -122,8 +113,9 @@ object Core {
         if (t.isEmpty()) { done(false); return }
         Thread {
             var ok = false
+            val o = JSONObject().put("t", "msg").put("title", title).put("body", body)
+            if (img != null) o.put("photo", true)
             try {
-                val o = JSONObject().put("t", "msg").put("title", title).put("body", body)
                 if (img != null) {
                     val opt = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     c.contentResolver.openInputStream(img).use { BitmapFactory.decodeStream(it, null, opt) }
@@ -137,6 +129,7 @@ object Core {
                 }
                 ok = rawPost(t, o.toString().toByteArray()).first
             } catch (e: Exception) {}
+            log(c, 0, describe(o) + if (ok) "" else " (failed)")
             Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
     }
@@ -164,6 +157,63 @@ object Core {
             .setCategory(Notification.CATEGORY_ALARM).setFullScreenIntent(pi, true).setContentIntent(pi).setOngoing(true).build()
         c.getSystemService(NotificationManager::class.java).notify(2, n)
         try { c.startActivity(i) } catch (e: Exception) {}
+    }
+
+    @Synchronized fun log(c: Context, kind: Int, text: String) {
+        try {
+            val p = prefs(c)
+            val old = JSONArray(p.getString("hist", "[]"))
+            val n = JSONArray()
+            n.put(JSONObject().put("k", kind).put("x", text).put("t", System.currentTimeMillis()))
+            var i = 0
+            while (i < old.length() && n.length() < 150) { n.put(old.get(i)); i++ }
+            p.edit().putString("hist", n.toString()).apply()
+        } catch (e: Exception) {}
+        Handler(Looper.getMainLooper()).post { Hooks.onLog?.invoke() }
+    }
+
+    fun describe(o: JSONObject): String = when (o.optString("t")) {
+        "wake" -> "Wake-up"
+        "polite" -> "Are you awake?"
+        "ack" -> "Confirmed they're up"
+        "late" -> "Not up yet notice"
+        "board" -> "Drawing synced"
+        "msg" -> {
+            val s = (o.optString("title") + " " + o.optString("body")).trim()
+            "Message" + (if (s.isNotEmpty()) ": $s" else "") + (if (o.optString("img").isNotEmpty() || o.optBoolean("photo")) " (photo)" else "")
+        }
+        else -> o.optString("t")
+    }
+
+    fun appMode(c: Context): Boolean = prefs(c).getBoolean("stop_app", false) && !prefs(c).getString("stop_pkg", "").isNullOrEmpty()
+
+    fun hasUsage(c: Context): Boolean = try {
+        c.getSystemService(AppOpsManager::class.java).checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.packageName) == AppOpsManager.MODE_ALLOWED
+    } catch (e: Exception) { false }
+
+    fun finishWake(c: Context) {
+        Alarm.stop(c)
+        prefs(c).edit().putInt("snz", 0).putBoolean("pend", false).apply()
+        try { c.getSystemService(AlarmManager::class.java).cancel(snoozePi(c)) } catch (e: Exception) {}
+        cancelAt(c, 5); log(c, 2, "You're up"); send(c, "ack")
+    }
+
+    fun sendBoard(c: Context, bmp: Bitmap, done: (Boolean) -> Unit) {
+        val t = prefs(c).getString("theirs", "")!!.trim()
+        if (t.isEmpty()) { done(false); return }
+        Thread {
+            var ok = false
+            try {
+                val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
+                val r = rawPost(t, bos.toByteArray(), true, "board.png")
+                if (r.first) {
+                    val o = JSONObject().put("t", "board").put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
+                    ok = rawPost(t, o.toString().toByteArray()).first
+                }
+            } catch (e: Exception) {}
+            log(c, 0, "Drawing synced" + if (ok) "" else " (failed)")
+            Handler(Looper.getMainLooper()).post { done(ok) }
+        }.start()
     }
 
     fun freshWake(c: Context) {
@@ -206,6 +256,24 @@ object Alarm {
     private var vol = 0.2f
     var ringing = false
     private var ctx: Context? = null
+    private var startAt = 0L
+    private val poll = object : Runnable {
+        override fun run() {
+            if (!ringing) return
+            val a = ctx ?: return
+            val pk = Core.prefs(a).getString("stop_pkg", "")!!
+            var found = false
+            try {
+                val u = a.getSystemService(UsageStatsManager::class.java)
+                val ev = u.queryEvents(startAt, System.currentTimeMillis()); val e = UsageEvents.Event()
+                while (ev.hasNextEvent()) {
+                    ev.getNextEvent(e)
+                    if (e.packageName == pk && (e.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND || e.eventType == UsageEvents.Event.ACTIVITY_RESUMED)) found = true
+                }
+            } catch (e: Exception) {}
+            if (found) Core.finishWake(a) else h.postDelayed(this, 1500)
+        }
+    }
     private val ramp = object : Runnable {
         override fun run() {
             if (!ringing) return
@@ -219,7 +287,8 @@ object Alarm {
         ctx = c.applicationContext
         val a = ctx!!
         if (ringing) return
-        ringing = true; vol = 0.2f
+        ringing = true; vol = 0.2f; startAt = System.currentTimeMillis()
+        Core.log(a, 2, "Alarm rang")
         val p = Core.prefs(a)
         val am = a.getSystemService(AudioManager::class.java)
         am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
@@ -237,7 +306,8 @@ object Alarm {
             vib?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 600, 400), 0))
         } catch (e: Exception) {}
         h.postDelayed(ramp, 6000)
-        if (!p.getBoolean("forever", true)) h.postDelayed({ stop(a) }, 90000)
+        if (Core.appMode(a)) h.postDelayed(poll, 1500)
+        else if (!p.getBoolean("forever", true)) h.postDelayed({ stop(a) }, 90000)
         Core.ring(a)
     }
 
@@ -325,6 +395,19 @@ class ListenService : Service() {
 
     private fun handle(m: JSONObject) {
         val t = m.optString("t")
+        Core.log(this, 1, Core.describe(m))
+        if (t == "board") {
+            Thread {
+                try {
+                    val bmp = URL(m.optString("img")).openStream().use { BitmapFactory.decodeStream(it) }
+                    if (bmp != null) {
+                        Board.store(this, bmp)
+                        Handler(Looper.getMainLooper()).post { Board.view?.reload(); Core.info(this, "Drawing updated", "Your partner saved a new drawing") }
+                    }
+                } catch (e: Exception) {}
+            }.start()
+            return
+        }
         if (t == "msg") {
             Thread {
                 var bmp: Bitmap? = null
@@ -373,125 +456,188 @@ class ListenService : Service() {
     }
 }
 
+// ---------- Hooks / Board ----------
+object Hooks { var onLog: (() -> Unit)? = null }
+
+val PAPER = Color.parseColor("#FAF8F2")
+
+object Board {
+    const val W = 1000; const val H = 1400
+    var view: DrawView? = null
+    fun file(c: Context) = java.io.File(c.filesDir, "board.png")
+    fun load(c: Context): Bitmap {
+        val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(bmp); cv.drawColor(PAPER)
+        try {
+            val f = file(c)
+            if (f.exists()) BitmapFactory.decodeFile(f.path)?.let { cv.drawBitmap(Bitmap.createScaledBitmap(it, W, H, true), 0f, 0f, null) }
+        } catch (e: Exception) {}
+        return bmp
+    }
+    fun store(c: Context, bmp: Bitmap) {
+        try { file(c).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) } } catch (e: Exception) {}
+    }
+}
+
+class DrawView(private val c: Context) : View(c) {
+    private val bmp = Board.load(c)
+    private val cv = Canvas(bmp)
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    private val path = Path()
+    private val m = Matrix()
+    private val inv = Matrix()
+    private val undo = ArrayList<Bitmap>()
+    var color = Color.parseColor("#111111")
+    var eraser = false
+    var size = 14f
+    private var lx = 0f; private var ly = 0f; private var mx = 0f; private var my = 0f
+
+    override fun onDraw(canvas: Canvas) {
+        val s = minOf(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
+        m.reset(); m.postScale(s, s); m.postTranslate((width - bmp.width * s) / 2, (height - bmp.height * s) / 2); m.invert(inv)
+        canvas.drawBitmap(bmp, m, null)
+    }
+    private fun push() {
+        bmp.copy(Bitmap.Config.ARGB_8888, false)?.let { undo.add(it) }
+        if (undo.size > 6) undo.removeAt(0).recycle()
+    }
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        parent.requestDisallowInterceptTouchEvent(true)
+        val pt = floatArrayOf(e.x, e.y); inv.mapPoints(pt)
+        paint.color = if (eraser) PAPER else color; paint.strokeWidth = size
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { push(); lx = pt[0]; ly = pt[1]; mx = lx; my = ly; cv.drawPoint(lx, ly, paint) }
+            MotionEvent.ACTION_MOVE -> {
+                val midx = (pt[0] + lx) / 2; val midy = (pt[1] + ly) / 2
+                path.reset(); path.moveTo(mx, my); path.quadTo(lx, ly, midx, midy); cv.drawPath(path, paint)
+                mx = midx; my = midy; lx = pt[0]; ly = pt[1]
+            }
+            MotionEvent.ACTION_UP -> { path.reset(); path.moveTo(mx, my); path.lineTo(lx, ly); cv.drawPath(path, paint) }
+        }
+        invalidate(); return true
+    }
+    fun undo() { if (undo.isNotEmpty()) { val b = undo.removeAt(undo.size - 1); cv.drawBitmap(b, 0f, 0f, null); b.recycle(); invalidate() } }
+    fun clear() { push(); cv.drawColor(PAPER); invalidate() }
+    fun reload() { cv.drawBitmap(Board.load(c), 0f, 0f, null); invalidate() }
+    fun saveLocal() = Board.store(c, bmp)
+    fun snapshot(): Bitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
+}
+
+// ---------- Swipe pager ----------
+class Pager(c: Context, private val onScroll: (Float) -> Unit, private val onSettle: (Int) -> Unit) : FrameLayout(c) {
+    var pos = 0f
+    private var downX = 0f; private var downY = 0f; private var lastX = 0f
+    private var drag = false
+    private val slop = ViewConfiguration.get(c).scaledTouchSlop
+    private var vt: VelocityTracker? = null
+    private var anim: ValueAnimator? = null
+
+    private fun apply() {
+        for (i in 0 until childCount) {
+            val v = getChildAt(i); val d = i - pos
+            v.translationX = d * width
+            v.visibility = if (Math.abs(d) < 1f) View.VISIBLE else View.INVISIBLE
+        }
+        onScroll(pos)
+    }
+    override fun onLayout(ch: Boolean, l: Int, t: Int, r: Int, b: Int) { super.onLayout(ch, l, t, r, b); apply() }
+
+    fun goTo(i: Int, animate: Boolean = true) {
+        anim?.cancel()
+        try { context.getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(windowToken, 0) } catch (e: Exception) {}
+        val target = i.coerceIn(0, childCount - 1)
+        if (!animate) { pos = target.toFloat(); apply(); onSettle(target); return }
+        anim = ValueAnimator.ofFloat(pos, target.toFloat()).apply {
+            duration = 320; interpolator = DecelerateInterpolator()
+            addUpdateListener { pos = it.animatedValue as Float; apply() }
+            addListener(object : AnimatorListenerAdapter() { override fun onAnimationEnd(a: Animator) { onSettle(target) } })
+            start()
+        }
+    }
+    private fun track(e: MotionEvent) { if (vt == null) vt = VelocityTracker.obtain(); vt!!.addMovement(e) }
+
+    override fun onInterceptTouchEvent(e: MotionEvent): Boolean {
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) { downX = e.x; downY = e.y; lastX = e.x; drag = false; anim?.cancel(); vt?.recycle(); vt = null }
+        track(e)
+        if (e.actionMasked == MotionEvent.ACTION_MOVE && !drag &&
+            Math.abs(e.x - downX) > slop && Math.abs(e.x - downX) > Math.abs(e.y - downY)) { drag = true; lastX = e.x }
+        return drag
+    }
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) { downX = e.x; downY = e.y; lastX = e.x; drag = false; anim?.cancel(); vt?.recycle(); vt = null }
+        track(e)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_MOVE -> {
+                if (!drag && Math.abs(e.x - downX) > slop && Math.abs(e.x - downX) > Math.abs(e.y - downY)) { drag = true; lastX = e.x }
+                if (drag) { pos = (pos - (e.x - lastX) / width).coerceIn(0f, childCount - 1f); lastX = e.x; apply() }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                vt?.computeCurrentVelocity(1000); val vx = vt?.xVelocity ?: 0f
+                vt?.recycle(); vt = null
+                var tgt = Math.round(pos)
+                if (vx < -800f) tgt = Math.ceil(pos.toDouble()).toInt() else if (vx > 800f) tgt = Math.floor(pos.toDouble()).toInt()
+                drag = false; goTo(tgt)
+            }
+        }
+        return true
+    }
+}
+
 // ---------- UI base ----------
 abstract class Base : Activity() {
     lateinit var t: Th
-    lateinit var s: Sty
     private var ai = -1
-    private var si = -1
     private var rootV: View? = null
 
     fun dp(x: Int): Float = x * resources.displayMetrics.density
     fun dpi(x: Int): Int = dp(x).toInt()
     private fun tIdx() = Core.prefs(this).getInt("theme", 0).coerceIn(0, THEMES.size - 1)
-    private fun sIdx() = Core.prefs(this).getInt("style", 0).coerceIn(0, STYLES.size - 1)
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        ai = tIdx(); si = sIdx(); t = THEMES[ai]; s = STYLES[si]
-        window.statusBarColor = t.bg1; window.navigationBarColor = if (s.flat) t.bg1 else t.bg2
+        ai = tIdx(); t = THEMES[ai]
+        window.statusBarColor = t.bg1; window.navigationBarColor = t.bg2
         if (!t.dark) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
     }
-    override fun onResume() { super.onResume(); if (tIdx() != ai || sIdx() != si) recreate() }
+    override fun onResume() { super.onResume(); if (tIdx() != ai) recreate() }
 
     fun show(v: FrameLayout) {
-        v.background = if (s.flat) ColorDrawable(t.bg1) else GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(t.bg1, t.bg2))
+        v.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(t.bg1, t.bg2))
         v.isFocusableInTouchMode = true; rootV = v; setContentView(v)
     }
-
-    // ----- colour helpers -----
-    val glass: Int get() = (t.text and 0x00FFFFFF) or 0x44000000
-    fun opaque(): Int = if (t.dark) t.bg2 else Color.WHITE
-    fun softFace(): Int = if (t.dark) lighten(t.bg2, 0.1f) else Color.WHITE
-    fun darken(c: Int, f: Float): Int = Color.rgb((Color.red(c) * f).toInt(), (Color.green(c) * f).toInt(), (Color.blue(c) * f).toInt())
-    fun lighten(c: Int, f: Float): Int = Color.rgb(Color.red(c) + ((255 - Color.red(c)) * f).toInt(),
-        Color.green(c) + ((255 - Color.green(c)) * f).toInt(), Color.blue(c) + ((255 - Color.blue(c)) * f).toInt())
-
-    // ----- drawables -----
     fun shape(c: Int, r: Float) = GradientDrawable().apply { setColor(c); cornerRadius = r }
-    fun hard(face: Int, edge: Int, shadow: Int, r: Float, w: Int, off: Int): Drawable {
-        val sh = shape(shadow, r)
-        val fc = shape(face, r).apply { setStroke(w, edge) }
-        return LayerDrawable(arrayOf<Drawable>(sh, fc)).apply { setLayerInset(0, off, off, 0, 0); setLayerInset(1, 0, 0, off, off) }
-    }
-    fun bub(face: Int, r: Float, depth: Int): Drawable {
-        val sh = shape(darken(face, 0.7f), r); val fc = shape(face, r)
-        return LayerDrawable(arrayOf<Drawable>(sh, fc)).apply { setLayerInset(1, 0, 0, 0, depth) }
-    }
-    fun cardBg(st: Sty = s): Drawable = when (st.card) {
-        0 -> shape(t.card, dp(st.rad))
-        1 -> shape(t.card, dp(st.rad)).apply { setStroke(dpi(1), glass) }
-        2 -> shape(Color.TRANSPARENT, 0f).apply { setStroke(dpi(1), t.ac1) }
-        3 -> hard(opaque(), t.text, t.ac1, dp(st.rad), dpi(3), dpi(5))
-        4 -> shape(softFace(), dp(st.rad))
-        else -> shape(Color.TRANSPARENT, dp(st.rad)).apply { setStroke(dpi(1), t.sub) }
-    }
-    fun btnFace(primary: Boolean, st: Sty = s): Drawable {
-        val r = dp(when (st.btn) { 3 -> 6; 2 -> 0; 6 -> 2; else -> 28 })
-        return when (st.btn) {
-            0 -> if (primary) GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(t.ac1, t.ac2)).apply { cornerRadius = r } else shape(t.card, r)
-            1 -> shape(if (primary) (t.ac1 and 0x00FFFFFF) or 0x66000000 else t.card, r).apply { setStroke(dpi(1), if (primary) t.ac1 else glass) }
-            2 -> shape(Color.TRANSPARENT, r).apply { setStroke(dpi(2), if (primary) t.ac1 else t.sub) }
-            3 -> hard(if (primary) t.ac1 else opaque(), t.text, t.text, r, dpi(3), dpi(5))
-            4 -> bub(if (primary) t.ac1 else softFace(), r, dpi(6))
-            5 -> shape(if (primary) t.ac1 else softFace(), r)
-            else -> shape(if (primary) t.text else Color.TRANSPARENT, r).apply { setStroke(dpi(1), t.text) }
-        }
-    }
-    fun btnText(primary: Boolean, st: Sty = s): Int = when (st.btn) {
-        1 -> t.text
-        2 -> if (primary) t.ac1 else t.sub
-        6 -> if (primary) t.bg1 else t.text
-        else -> if (primary) t.btnText else t.text
-    }
-    private fun fieldBg(): Drawable = when (s.card) {
-        2 -> shape(Color.TRANSPARENT, 0f).apply { setStroke(dpi(1), t.ac1) }
-        3 -> shape(Color.TRANSPARENT, dp(4)).apply { setStroke(dpi(3), t.text) }
-        5 -> shape(Color.TRANSPARENT, dp(2)).apply { setStroke(dpi(1), t.sub) }
-        else -> shape(if (t.dark) 0x22FFFFFF else 0x14000000, dp(14))
-    }
-
-    // ----- text / widgets -----
-    fun lab(x: String): String = when (s.fmt) { 1, 3 -> x.uppercase(); 2 -> "[ " + x.uppercase() + " ]"; else -> x }
-    fun face(bold: Boolean, st: Sty = s): Typeface =
-        Typeface.create(if (bold) st.bold else st.font, if (bold && st.bold == st.font) Typeface.BOLD else Typeface.NORMAL)
     fun tv(x: String, size: Float, color: Int = t.text, bold: Boolean = false) = TextView(this).apply {
-        text = x; textSize = size; setTextColor(color); typeface = face(bold); letterSpacing = s.spacing
+        text = x; textSize = size; setTextColor(color)
+        typeface = Typeface.create(if (bold) "sans-serif-medium" else "sans-serif", Typeface.NORMAL)
     }
-    fun sec(x: String) = tv(lab(x), 12f, t.sub, true).apply { letterSpacing = 0.15f }
+    fun sec(x: String) = tv(x, 12f, t.sub, true).apply { letterSpacing = 0.15f }
     fun btn(label: String, primary: Boolean, click: () -> Unit) = Button(this).apply {
-        text = lab(label); isAllCaps = false; textSize = 16f; stateListAnimator = null
-        typeface = face(true); letterSpacing = s.spacing; setTextColor(btnText(primary))
-        background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), btnFace(primary), null)
-        val ex = if (s.btn == 3) dpi(5) else 0
-        val ey = if (s.btn == 3) dpi(5) else if (s.btn == 4) dpi(6) else 0
-        setPadding(dpi(20), dpi(14), dpi(20) + ex, dpi(14) + ey)
-        if (s.btn == 5) elevation = dp(6)
+        text = label; isAllCaps = false; textSize = 16f; stateListAnimator = null
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        setTextColor(if (primary) t.btnText else t.text)
+        val base = if (primary) GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(t.ac1, t.ac2)).apply { cornerRadius = dp(28) }
+                   else shape(t.card, dp(28))
+        background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), base, null)
+        setPadding(dpi(20), dpi(14), dpi(20), dpi(14))
         setOnClickListener { click() }
     }
-    fun iconBtn(res: Int, click: () -> Unit) = ImageView(this).apply {
-        setImageResource(res); setColorFilter(btnText(false)); setPadding(dpi(15), dpi(15), dpi(15), dpi(15))
-        background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), btnFace(false), null)
-        if (s.btn == 5) elevation = dp(6)
-        setOnClickListener { click() }
-    }
+    fun mini(label: String, primary: Boolean, click: () -> Unit) =
+        btn(label, primary, click).apply { textSize = 14f; setPadding(dpi(10), dpi(8), dpi(10), dpi(8)) }
     fun sw(label: String, on: Boolean, f: (Boolean) -> Unit) = Switch(this).apply {
-        text = label; setTextColor(t.text); textSize = 15f; typeface = face(false); isChecked = on
+        text = label; setTextColor(t.text); textSize = 15f; isChecked = on
         thumbTintList = ColorStateList.valueOf(t.ac1); trackTintList = ColorStateList.valueOf(t.sub)
         setOnCheckedChangeListener { _, v -> f(v) }
     }
     fun field(hint: String, value: String) = EditText(this).apply {
         setText(value); setHint(hint); setTextColor(t.text); setHintTextColor(t.sub); textSize = 15f; isSingleLine = true
-        typeface = face(false); background = fieldBg(); setPadding(dpi(14), dpi(12), dpi(14), dpi(12))
+        background = shape(if (t.dark) 0x22FFFFFF else 0x14000000, dp(14)); setPadding(dpi(14), dpi(12), dpi(14), dpi(12))
     }
     fun LinearLayout.put(v: View, top: Int = 12, h: Int = -2) {
         addView(v, LinearLayout.LayoutParams(-1, h).apply { topMargin = dpi(top) })
     }
     fun card(vararg v: View) = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL; background = cardBg()
-        val e = if (s.card == 3) dpi(5) else 0
-        setPadding(dpi(18), dpi(16), dpi(18) + e, dpi(16) + e)
-        if (s.card == 4) elevation = dp(8)
+        orientation = LinearLayout.VERTICAL; background = shape(t.card, dp(24))
+        setPadding(dpi(18), dpi(16), dpi(18), dpi(16))
         v.forEachIndexed { i, x -> put(x, if (i == 0) 0 else 10) }
     }
     fun row(a: View, b: View, w1: Float = 1f, w2: Float = 1f) = LinearLayout(this).apply {
@@ -499,7 +645,6 @@ abstract class Base : Activity() {
         addView(a, LinearLayout.LayoutParams(0, -2, w1).apply { marginEnd = dpi(6) })
         addView(b, LinearLayout.LayoutParams(0, -2, w2).apply { marginStart = dpi(6) })
     }
-    fun addBack(col: LinearLayout) { col.addView(btn("‹  Back", false) { finish() }, LinearLayout.LayoutParams(dpi(130), dpi(54))) }
     fun flash(v: TextView, x: String) { val o = v.text; v.text = x; v.postDelayed({ v.text = o }, 1500) }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
@@ -519,34 +664,45 @@ abstract class Base : Activity() {
 
 // ---------- Alarm screen ----------
 class AlarmActivity : Base() {
+    private val h = Handler(Looper.getMainLooper())
+    private val chk = object : Runnable { override fun run() { if (!Alarm.ringing) finish() else h.postDelayed(this, 500) } }
+    override fun onDestroy() { h.removeCallbacksAndMessages(null); super.onDestroy() }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         setShowWhenLocked(true); setTurnScreenOn(true)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val left = 2 - Core.prefs(this).getInt("snz", 0)
+        val p = Core.prefs(this)
+        val left = 2 - p.getInt("snz", 0)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dpi(28), dpi(28), dpi(28), dpi(28)) }
-        col.put(tv(lab("WAKE UP"), 18f, t.sub, true).apply { letterSpacing = 0.3f; gravity = Gravity.CENTER }, 0)
+        col.put(tv("WAKE UP", 18f, t.sub, true).apply { letterSpacing = 0.3f; gravity = Gravity.CENTER }, 0)
         col.put(TextClock(this).apply {
             format12Hour = "h:mm"; format24Hour = "H:mm"; textSize = 84f; setTextColor(t.text)
-            typeface = Typeface.create(if (s.font == "sans-serif") "sans-serif-light" else s.font, Typeface.NORMAL); gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL); gravity = Gravity.CENTER
         }, 8)
-        col.put(btn("I'M UP", true) { up() }.apply { textSize = 20f }, 48, dpi(104))
-        if (left > 0) col.put(btn("Snooze 5 min  ($left left)", false) { snooze() }.apply { textSize = 20f }, 14, dpi(104))
+        if (Core.appMode(this)) {
+            val nm = p.getString("stop_name", "the app")!!
+            col.put(tv("Open $nm to stop the alarm", 18f, t.text, true).apply { gravity = Gravity.CENTER }, 40)
+            col.put(btn("Open $nm", true) { openApp() }.apply { textSize = 20f }, 24, dpi(104))
+        } else {
+            col.put(btn("I'M UP", true) { up() }.apply { textSize = 20f }, 48, dpi(104))
+            if (left > 0) col.put(btn("Snooze 5 min  ($left left)", false) { snooze() }.apply { textSize = 20f }, 14, dpi(104))
+        }
         val root = FrameLayout(this); root.addView(col, FrameLayout.LayoutParams(-1, -1)); show(root)
+        h.postDelayed(chk, 1500)
     }
-    private fun up() {
-        Alarm.stop(this)
-        val p = Core.prefs(this)
-        p.edit().putInt("snz", 0).putBoolean("pend", false).apply()
-        try { getSystemService(AlarmManager::class.java).cancel(snoozePi(this)) } catch (e: Exception) {}
-        Core.cancelAt(this, 5)
-        Core.send(this, "ack"); finish()
+    private fun openApp() {
+        val pk = Core.prefs(this).getString("stop_pkg", "")!!
+        try { packageManager.getLaunchIntentForPackage(pk)?.let { startActivity(it) } } catch (e: Exception) {}
+        if (!Core.hasUsage(this)) { Core.finishWake(this); finish() }
     }
+    private fun up() { Core.finishWake(this); finish() }
     private fun snooze() {
         Alarm.stop(this)
         val p = Core.prefs(this)
         val at = System.currentTimeMillis() + 5 * 60 * 1000L
         p.edit().putInt("snz", p.getInt("snz", 0) + 1).putLong("snzu", at + 10 * 60 * 1000L).apply()
+        Core.log(this, 2, "You snoozed")
         try {
             val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
             getSystemService(AlarmManager::class.java).setAlarmClock(AlarmManager.AlarmClockInfo(at, open), snoozePi(this))
@@ -555,26 +711,40 @@ class AlarmActivity : Base() {
     }
 }
 
-// ---------- Main screen ----------
+// ---------- Main: 5 swipeable tabs ----------
 class MainActivity : Base() {
+    companion object { var keepPage = 2; var keepY = 0; var keepX = 0 }
+    private lateinit var pager: Pager
+    private lateinit var draw: DrawView
     private lateinit var grace: EditText
-    private fun saveGrace() {
-        Core.prefs(this).edit().putInt("grace", grace.text.toString().toIntOrNull()?.coerceIn(1, 180) ?: 15).apply()
-    }
-    override fun onPause() { saveGrace(); super.onPause() }
+    private lateinit var histBox: LinearLayout
+    private lateinit var mine: EditText
+    private lateinit var theirs: EditText
+    private lateinit var musicLbl: TextView
+    private lateinit var stopLbl: TextView
+    private lateinit var tField: EditText
+    private lateinit var bField: EditText
+    private lateinit var preview: ImageView
+    private lateinit var tplBox: LinearLayout
+    private lateinit var nStatus: TextView
+    private var img: Uri? = null
+    private val argb = ArgbEvaluator()
 
-    private fun bigBg(): Drawable = when (s.big) {
-        0 -> GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(t.ac1, t.ac2)).apply { shape = GradientDrawable.OVAL }
-        1 -> hard(t.ac1, t.text, t.text, dp(18), dpi(4), dpi(8))
-        2 -> GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf((t.ac1 and 0x00FFFFFF) or 0x55000000, (t.ac2 and 0x00FFFFFF) or 0x22000000)).apply { shape = GradientDrawable.OVAL; setStroke(dpi(2), t.ac1) }
-        3 -> shape(Color.TRANSPARENT, 0f).apply { setStroke(dpi(3), t.ac1) }
-        4 -> GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(softFace()) }
-        5 -> GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dpi(2), t.text) }
-        else -> LayerDrawable(arrayOf<Drawable>(
-            GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(darken(t.ac1, 0.7f)) },
-            GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(t.ac1) })).apply { setLayerInset(1, 0, 0, 0, dpi(10)) }
+    private fun saveGrace() { Core.prefs(this).edit().putInt("grace", grace.text.toString().toIntOrNull()?.coerceIn(1, 180) ?: 15).apply() }
+    private fun saveCodes() {
+        Core.prefs(this).edit().putString("mine", mine.text.toString().trim()).putString("theirs", theirs.text.toString().trim()).apply()
     }
-    private fun bigText(): Int = when (s.big) { 2, 5 -> t.text; 3, 4 -> t.ac1; else -> t.btnText }
+    override fun onPause() { saveGrace(); saveCodes(); draw.saveLocal(); super.onPause() }
+    override fun onDestroy() { Hooks.onLog = null; Board.view = null; super.onDestroy() }
+
+    private fun updateTabs(tabs: List<ImageView>, pos: Float) {
+        tabs.forEachIndexed { i, v ->
+            val k = 1f - Math.min(1f, Math.abs(i - pos))
+            val sc = 1f + 0.6f * k
+            v.scaleX = sc; v.scaleY = sc; v.translationY = -dpi(7) * k
+            v.setColorFilter(argb.evaluate(k, t.sub, t.ac1) as Int)
+        }
+    }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -585,90 +755,83 @@ class MainActivity : Base() {
             val c = "abcdefghijkmnpqrstuvwxyz23456789"
             p.edit().putString("mine", "wake-" + (1..12).map { c.random() }.joinToString("")).apply()
         }
-        val status = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
-        fun go(type: String, ok: String) {
-            if (p.getString("theirs", "").isNullOrBlank()) { status.text = "Add your partner's code in Settings"; return }
-            status.text = "Sending..."
-            Core.send(this, type) { good -> status.text = if (good) ok else "Couldn't send. Check your connection" }
-        }
+        val pages = listOf(drawPage(), notifyPage(), wakePage(p), histPage(), settingsPage(p))
+        Hooks.onLog = { renderHist() }
 
-        val ringV = View(this).apply {
-            visibility = if (s.pulse || s.big == 5) View.VISIBLE else View.GONE
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                if (s.big == 5) { setColor(Color.TRANSPARENT); setStroke(dpi(1), t.sub) } else setColor((t.ac1 and 0x00FFFFFF) or 0x33000000)
-            }
-        }
-        val big = Button(this).apply {
-            text = lab("WAKE UP"); textSize = 26f; isAllCaps = false; stateListAnimator = null
-            typeface = face(true); letterSpacing = s.spacing + 0.08f; setTextColor(bigText())
-            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), bigBg(), null)
-            if (s.big == 4) elevation = dp(16)
-            setOnClickListener { go("wake", "Wake-up sent") }
-        }
-        val wrap = FrameLayout(this)
-        wrap.addView(ringV, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
-        wrap.addView(big, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
-        wrap.addOnLayoutChangeListener { _, l, tp, r, bt, _, _, _, _ ->
-            val m = minOf(r - l, bt - tp)
-            val bs = (m * (if (s.big == 1 || s.big == 3) 0.70f else 0.78f)).toInt()
-            if (m > 0 && big.layoutParams.width != bs) {
-                big.layoutParams = FrameLayout.LayoutParams(bs, bs, Gravity.CENTER)
-                ringV.layoutParams = FrameLayout.LayoutParams(m, m, Gravity.CENTER)
-            }
-        }
-        if (s.pulse) ObjectAnimator.ofPropertyValuesHolder(ringV, PropertyValuesHolder.ofFloat("scaleX", 0.92f, 1f), PropertyValuesHolder.ofFloat("scaleY", 0.92f, 1f)).apply {
-            duration = 1500; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE; start()
-        }
+        val tabs = ArrayList<ImageView>()
+        pager = Pager(this, { pos -> updateTabs(tabs, pos) }, { i -> if (i == 3) renderHist() })
+        pager.pos = keepPage.toFloat()
+        pages.forEach { pager.addView(it, FrameLayout.LayoutParams(-1, -1)) }
 
-        grace = field("minutes", p.getInt("grace", 15).toString()).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            onFocusChangeListener = View.OnFocusChangeListener { _, f -> if (!f) saveGrace() }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            background = shape(t.card, dp(32)); clipChildren = false; clipToPadding = false
         }
-        val tb = btn("", false) {}
-        fun lbl() { tb.text = lab("Wake-up time   %02d:%02d".format(p.getInt("sh", 8), p.getInt("sm", 0))) }
-        lbl()
-        tb.setOnClickListener {
-            try {
-                TimePickerDialog(this, { _, h, m -> p.edit().putInt("sh", h).putInt("sm", m).apply(); lbl(); Core.scheduleNext(this) },
-                    p.getInt("sh", 8), p.getInt("sm", 0), true).show()
-            } catch (e: Exception) {}
+        val icons = intArrayOf(R.drawable.ic_brush, R.drawable.ic_bell, R.drawable.ic_alarm, R.drawable.ic_history, R.drawable.ic_settings)
+        icons.forEachIndexed { i, r ->
+            val v = ImageView(this).apply { setImageResource(r); scaleType = ImageView.ScaleType.CENTER_INSIDE; setPadding(dpi(20), dpi(20), dpi(20), dpi(20)); setOnClickListener { pager.goTo(i) } }
+            tabs.add(v); bar.addView(v, LinearLayout.LayoutParams(0, dpi(68), 1f))
         }
-
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(24), dpi(40), dpi(24), dpi(20)) }
-        col.addView(wrap, LinearLayout.LayoutParams(-1, 0, 1f))
-        col.put(status, 4)
-        col.put(btn("Are you awake?", false) { go("polite", "Sent") }, 14)
-        col.put(card(
-            sw("Alarm never stops until I tap I'm up", p.getBoolean("forever", true)) { v -> p.edit().putBoolean("forever", v).apply() },
-            sw("Scheduled wake-up", p.getBoolean("sched_on", false)) { v -> p.edit().putBoolean("sched_on", v).apply(); Core.scheduleNext(this) },
-            tb,
-            tv("If I'm not up after this many minutes, notify my partner:", 13f, t.sub),
-            grace), 16)
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(iconBtn(R.drawable.ic_settings) { startActivity(Intent(this, SettingsActivity::class.java)) }, LinearLayout.LayoutParams(dpi(56), dpi(56)))
-        bar.addView(iconBtn(R.drawable.ic_bell) { startActivity(Intent(this, NotifyActivity::class.java)) },
-            LinearLayout.LayoutParams(dpi(56), dpi(56)).apply { marginStart = dpi(12) })
-        col.addView(bar, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dpi(16) })
-
-        val root = FrameLayout(this)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false; clipToPadding = false }
+        col.addView(pager, LinearLayout.LayoutParams(-1, 0, 1f))
+        col.addView(bar, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dpi(14), dpi(6), dpi(14), dpi(14)) })
+        val root = FrameLayout(this); root.clipChildren = false
         root.addView(col, FrameLayout.LayoutParams(-1, -1))
         show(root)
+        keepPage = 2
         startForegroundService(Intent(this, ListenService::class.java))
     }
-}
 
-// ---------- Custom notification ----------
-class NotifyActivity : Base() {
-    private var img: Uri? = null
-    private lateinit var preview: ImageView
-    private lateinit var tField: EditText
-    private lateinit var bField: EditText
-    private lateinit var tplBox: LinearLayout
-    private lateinit var status: TextView
+    // ----- tab 0: drawing pad -----
+    private fun drawPage(): View {
+        draw = DrawView(this); Board.view = draw
+        val frame = FrameLayout(this).apply { background = shape(PAPER, dp(20)); clipToOutline = true; addView(draw, FrameLayout.LayoutParams(-1, -1)) }
+        val status = tv("", 13f, t.sub).apply { gravity = Gravity.CENTER }
+        val colors = listOf("#111111", "#FFFFFF", "#E53935", "#FB8C00", "#FDD835", "#43A047", "#1E88E5", "#8E24AA")
+        val dots = ArrayList<View>()
+        val eraseBtn = mini("Eraser", false) {}
+        fun refresh() {
+            dots.forEachIndexed { i, v ->
+                val cc = Color.parseColor(colors[i]); val sel = !draw.eraser && draw.color == cc
+                v.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(cc); setStroke(dpi(if (sel) 3 else 1), if (sel) t.ac1 else t.sub) }
+            }
+            eraseBtn.text = if (draw.eraser) "Eraser on" else "Eraser"
+        }
+        val dotRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        colors.forEach { cs ->
+            val v = View(this); dots.add(v)
+            v.setOnClickListener { draw.color = Color.parseColor(cs); draw.eraser = false; refresh() }
+            dotRow.addView(v, LinearLayout.LayoutParams(0, dpi(34), 1f).apply { setMargins(dpi(3), 0, dpi(3), 0) })
+        }
+        eraseBtn.setOnClickListener { draw.eraser = !draw.eraser; refresh() }
+        refresh()
+        val undoBtn = mini("Undo", false) { draw.undo() }
+        val clearBtn = mini("Clear", false) { draw.clear() }
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf(eraseBtn, undoBtn, clearBtn).forEachIndexed { i, x -> tools.addView(x, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dpi(if (i == 0) 0 else 4), 0, dpi(if (i == 2) 0 else 4), 0) }) }
+        val seek = SeekBar(this).apply {
+            max = 56; progress = 10
+            progressTintList = ColorStateList.valueOf(t.ac1); thumbTintList = ColorStateList.valueOf(t.ac1)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, v: Int, u: Boolean) { draw.size = 4f + v }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        val save = btn("Save & sync", true) {
+            draw.saveLocal()
+            if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) status.text = "Saved here. Add your partner's code in Settings to sync."
+            else { status.text = "Syncing..."; Core.sendBoard(this, draw.snapshot()) { ok -> status.text = if (ok) "Synced" else "Couldn't sync. Check your connection" } }
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(8)) }
+        col.put(dotRow, 0); col.put(tools, 10); col.put(seek, 4)
+        col.addView(frame, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dpi(6) })
+        col.put(status, 6); col.put(save, 6)
+        return col
+    }
 
+    // ----- tab 1: custom notification -----
     private fun tpls(): JSONArray = try { JSONArray(Core.prefs(this).getString("tpl", "[]")) } catch (e: Exception) { JSONArray() }
-
     private fun renderTpl() {
         tplBox.removeAllViews()
         val a = tpls()
@@ -685,13 +848,11 @@ class NotifyActivity : Base() {
             tplBox.put(row(use, del, 3f, 2f), if (i == 0) 0 else 8)
         }
     }
-
-    override fun onCreate(b: Bundle?) {
-        super.onCreate(b)
-        status = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
-        tField = field("Title (e.g. Good luck at school)", "")
+    private fun notifyPage(): View {
+        nStatus = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
+        tField = field("Title", "").apply { id = 1001 }
         bField = field("Message", "").apply {
-            isSingleLine = false; minLines = 3; gravity = Gravity.TOP or Gravity.START
+            id = 1002; isSingleLine = false; minLines = 3; gravity = Gravity.TOP or Gravity.START
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
         }
         preview = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; visibility = View.GONE }
@@ -699,68 +860,130 @@ class NotifyActivity : Base() {
         val rem = btn("Remove photo", false) { img = null; preview.visibility = View.GONE }
         val send = btn("Send", true) {
             val ti = tField.text.toString().trim(); val bo = bField.text.toString().trim()
-            if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) status.text = "Add your partner's code in Settings"
-            else if (ti.isEmpty() && bo.isEmpty() && img == null) status.text = "Write something or add a photo first"
+            if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) nStatus.text = "Add your partner's code in Settings"
+            else if (ti.isEmpty() && bo.isEmpty() && img == null) nStatus.text = "Write something or add a photo first"
             else {
-                status.text = "Sending..."
-                Core.sendCustom(this, ti, bo, img) { ok -> status.text = if (ok) "Sent" else "Couldn't send. Check your connection" }
+                nStatus.text = "Sending..."
+                Core.sendCustom(this, ti, bo, img) { ok -> nStatus.text = if (ok) "Sent" else "Couldn't send. Check your connection" }
             }
         }
         val save = btn("Save template", false) {
             val ti = tField.text.toString().trim(); val bo = bField.text.toString().trim()
-            if (ti.isEmpty() && bo.isEmpty()) status.text = "Nothing to save yet"
+            if (ti.isEmpty() && bo.isEmpty()) nStatus.text = "Nothing to save yet"
             else {
                 val a = tpls(); a.put(JSONObject().put("title", ti).put("body", bo))
-                Core.prefs(this).edit().putString("tpl", a.toString()).apply(); renderTpl(); status.text = "Template saved"
+                Core.prefs(this).edit().putString("tpl", a.toString()).apply(); renderTpl(); nStatus.text = "Template saved"
             }
         }
         tplBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(32)) }
-        addBack(col)
-        col.put(tv("Custom notification", 28f, t.text, true), 8)
-        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), status, send, save), 16)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(16)) }
+        col.put(tv("Custom notification", 28f, t.text, true), 0)
+        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), nStatus, send, save), 16)
+        preview.layoutParams = (preview.layoutParams as LinearLayout.LayoutParams).apply { height = dpi(180) }
         col.put(card(sec("TEMPLATES"), tplBox), 14)
         col.put(tv("Photos are sent through ntfy.sh and stay available for about 3 hours. Templates save text only.", 12f, t.sub), 10)
-        preview.layoutParams = LinearLayout.LayoutParams(-1, dpi(180))
         renderTpl()
-        val scroll = ScrollView(this); scroll.addView(col)
-        val root = FrameLayout(this); root.addView(scroll); show(root)
+        return ScrollView(this).apply { addView(col) }
     }
 
-    override fun onActivityResult(r: Int, c: Int, d: Intent?) {
-        super.onActivityResult(r, c, d)
-        val u = d?.data ?: return
-        if (r == 8 && c == RESULT_OK) { img = u; preview.setImageURI(u); preview.visibility = View.VISIBLE }
-    }
-}
-
-// ---------- Settings ----------
-class SettingsActivity : Base() {
-    companion object { var keepY = 0 }
-    private lateinit var mine: EditText
-    private lateinit var theirs: EditText
-    private lateinit var musicLbl: TextView
-    private fun save() {
-        Core.prefs(this).edit().putString("mine", mine.text.toString().trim()).putString("theirs", theirs.text.toString().trim()).apply()
-    }
-    override fun onPause() { save(); super.onPause() }
-
-    override fun onCreate(b: Bundle?) {
-        super.onCreate(b)
-        val p = Core.prefs(this)
-        val scroll = ScrollView(this)
-        mine = field("Your code", p.getString("mine", "")!!)
-        theirs = field("Paste your partner's code", p.getString("theirs", "")!!)
-        for (e in listOf(mine, theirs)) e.onFocusChangeListener = View.OnFocusChangeListener { _, f -> if (!f) save() }
-
-        val copy = btn("Copy", false) {}
-        copy.setOnClickListener {
-            getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("code", mine.text.toString())); flash(copy, lab("Copied"))
+    // ----- tab 2: wake up alarm -----
+    private fun wakePage(p: SharedPreferences): View {
+        val status = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
+        fun go(type: String, ok: String) {
+            if (p.getString("theirs", "").isNullOrBlank()) { status.text = "Add your partner's code in Settings"; return }
+            status.text = "Sending..."
+            Core.send(this, type) { good -> status.text = if (good) ok else "Couldn't send. Check your connection" }
         }
+        val ringV = View(this).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor((t.ac1 and 0x00FFFFFF) or 0x33000000) } }
+        val big = Button(this).apply {
+            text = "WAKE UP"; textSize = 26f; isAllCaps = false; stateListAnimator = null
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); letterSpacing = 0.08f; setTextColor(t.btnText)
+            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF),
+                GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(t.ac1, t.ac2)).apply { shape = GradientDrawable.OVAL }, null)
+            setOnClickListener { go("wake", "Wake-up sent") }
+        }
+        val wrap = FrameLayout(this)
+        wrap.addView(ringV, FrameLayout.LayoutParams(1, 1, Gravity.CENTER)); wrap.addView(big, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
+        wrap.addOnLayoutChangeListener { _, l, tp, r, bt, _, _, _, _ ->
+            val m = minOf(r - l, bt - tp); val bs = (m * 0.78f).toInt()
+            if (m > 0 && big.layoutParams.width != bs) {
+                big.layoutParams = FrameLayout.LayoutParams(bs, bs, Gravity.CENTER); ringV.layoutParams = FrameLayout.LayoutParams(m, m, Gravity.CENTER)
+            }
+        }
+        ObjectAnimator.ofPropertyValuesHolder(ringV, PropertyValuesHolder.ofFloat("scaleX", 0.92f, 1f), PropertyValuesHolder.ofFloat("scaleY", 0.92f, 1f)).apply {
+            duration = 1500; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE; start()
+        }
+        grace = field("min", p.getInt("grace", 15).toString()).apply {
+            id = 1005; inputType = InputType.TYPE_CLASS_NUMBER
+            onFocusChangeListener = View.OnFocusChangeListener { _, f -> if (!f) saveGrace() }
+        }
+        val tb = btn("", false) {}
+        fun lbl() { tb.text = "Wake-up time   %02d:%02d".format(p.getInt("sh", 8), p.getInt("sm", 0)) }
+        lbl()
+        tb.setOnClickListener {
+            try {
+                TimePickerDialog(this, { _, h, m -> p.edit().putInt("sh", h).putInt("sm", m).apply(); lbl(); Core.scheduleNext(this) },
+                    p.getInt("sh", 8), p.getInt("sm", 0), true).show()
+            } catch (e: Exception) {}
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(24), dpi(40), dpi(24), dpi(8)) }
+        col.addView(wrap, LinearLayout.LayoutParams(-1, 0, 1f))
+        col.put(status, 4)
+        col.put(btn("Are you awake?", false) { go("polite", "Sent") }, 14)
+        col.put(card(
+            sw("Alarm never stops", p.getBoolean("forever", true)) { v -> p.edit().putBoolean("forever", v).apply() },
+            sw("Scheduled wake-up", p.getBoolean("sched_on", false)) { v -> p.edit().putBoolean("sched_on", v).apply(); Core.scheduleNext(this) },
+            row(tb, grace, 3f, 1f),
+            tv("Wake-up time, and minutes before notifying my partner", 12f, t.sub)), 16)
+        return col
+    }
+
+    // ----- tab 3: history -----
+    private fun histPage(): View {
+        histBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val clear = btn("Clear history", false) { Core.prefs(this).edit().putString("hist", "[]").apply(); renderHist() }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(8)) }
+        col.put(tv("History", 30f, t.text, true), 0)
+        col.addView(ScrollView(this).apply { addView(histBox) }, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dpi(14) })
+        col.put(clear, 10)
+        renderHist()
+        return col
+    }
+    private fun renderHist() {
+        histBox.removeAllViews()
+        val a = try { JSONArray(Core.prefs(this).getString("hist", "[]")) } catch (e: Exception) { JSONArray() }
+        if (a.length() == 0) { histBox.addView(tv("Nothing yet. Wake-ups, messages and drawings will show up here.", 14f, t.sub)); return }
+        val f = java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i); val k = o.optInt("k")
+            val who = when (k) { 0 -> "SENT"; 1 -> "RECEIVED"; else -> "YOU" }
+            val col = when (k) { 0 -> t.ac1; 1 -> t.ac2; else -> t.sub }
+            histBox.put(card(tv(who + "  ·  " + f.format(java.util.Date(o.optLong("t"))), 12f, col, true), tv(o.optString("x"), 15f)), if (i == 0) 0 else 8)
+        }
+    }
+
+    // ----- tab 4: settings -----
+    private fun stopText(p: SharedPreferences): String { val n = p.getString("stop_name", ""); return if (n.isNullOrEmpty()) "No app chosen" else "App: $n" }
+    private fun pickApp() {
+        val pm = packageManager
+        val ri = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+            .filter { it.activityInfo.packageName != packageName }.sortedBy { it.loadLabel(pm).toString().lowercase() }
+        val names = ri.map { it.loadLabel(pm).toString() }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("Choose app").setItems(names) { _, i ->
+            val pr = Core.prefs(this)
+            pr.edit().putString("stop_pkg", ri[i].activityInfo.packageName).putString("stop_name", names[i]).apply()
+            stopLbl.text = stopText(pr)
+        }.show()
+    }
+    private fun settingsPage(p: SharedPreferences): View {
+        val sScroll = ScrollView(this); val tScroll = HorizontalScrollView(this)
+        mine = field("Your code", p.getString("mine", "")!!).apply { id = 1003 }
+        theirs = field("Paste your partner's code", p.getString("theirs", "")!!).apply { id = 1004 }
+        for (e in listOf(mine, theirs)) e.onFocusChangeListener = View.OnFocusChangeListener { _, f -> if (!f) saveCodes() }
+        val copy = btn("Copy", false) {}
+        copy.setOnClickListener { getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("code", mine.text.toString())); flash(copy, "Copied") }
         val share = btn("Share", true) {
-            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
-                .putExtra(Intent.EXTRA_TEXT, "My WakeUp code: " + mine.text.toString()), null))
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "My WakeUp code: " + mine.text.toString()), null))
         }
         musicLbl = tv(if (p.getString("tone", "").isNullOrEmpty()) "Default alarm sound" else "Custom music selected", 14f, t.sub)
         val pick = btn("Choose music", true) {
@@ -768,66 +991,58 @@ class SettingsActivity : Base() {
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION), 7)
         }
         val reset = btn("Use default", false) { p.edit().remove("tone").apply(); musicLbl.text = "Default alarm sound" }
+        stopLbl = tv(stopText(p), 13f, t.sub)
         val bg = btn("Allow background running", true) {
             try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
         }
-
-        val curT = p.getInt("theme", 0).coerceIn(0, THEMES.size - 1)
+        val cur = p.getInt("theme", 0).coerceIn(0, THEMES.size - 1)
         val themeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         THEMES.forEachIndexed { i, th ->
             val d = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(th.bg1, th.ac1, th.ac2)).apply {
-                shape = GradientDrawable.OVAL; if (i == curT) setStroke(dpi(3), t.text)
+                shape = GradientDrawable.OVAL; if (i == cur) setStroke(dpi(3), t.text)
             }
             val item = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dpi(6), dpi(4), dpi(6), dpi(4))
-                addView(View(this@SettingsActivity).apply { background = d }, LinearLayout.LayoutParams(dpi(56), dpi(56)))
+                addView(View(this@MainActivity).apply { background = d }, LinearLayout.LayoutParams(dpi(56), dpi(56)))
                 addView(tv(th.name, 12f, t.sub).apply { gravity = Gravity.CENTER })
-                setOnClickListener { keepY = scroll.scrollY; p.edit().putInt("theme", i).apply(); this@SettingsActivity.recreate(); overridePendingTransition(0, 0) }
+                setOnClickListener {
+                    keepPage = 4; keepY = sScroll.scrollY; keepX = tScroll.scrollX
+                    p.edit().putInt("theme", i).apply(); this@MainActivity.recreate(); overridePendingTransition(0, 0)
+                }
             }
             themeRow.addView(item)
         }
-        val curS = p.getInt("style", 0).coerceIn(0, STYLES.size - 1)
-        val styleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        STYLES.forEachIndexed { i, st ->
-            val chip = TextView(this).apply {
-                text = st.name; setTextColor(t.text); typeface = face(true, st); textSize = 14f; gravity = Gravity.CENTER
-                background = cardBg(st); setPadding(dpi(18), dpi(16), dpi(18), dpi(16))
-            }
-            val bar = View(this).apply { setBackgroundColor(t.ac1); visibility = if (i == curS) View.VISIBLE else View.INVISIBLE }
-            val item = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL; setPadding(dpi(6), dpi(4), dpi(10), dpi(4))
-                addView(chip, LinearLayout.LayoutParams(-2, -2))
-                addView(bar, LinearLayout.LayoutParams(-1, dpi(3)).apply { topMargin = dpi(8) })
-                setOnClickListener { keepY = scroll.scrollY; p.edit().putInt("style", i).apply(); this@SettingsActivity.recreate(); overridePendingTransition(0, 0) }
-            }
-            styleRow.addView(item)
-        }
-        val themeScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(themeRow) }
-        val styleScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(styleRow) }
-
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(32)) }
-        addBack(col)
-        col.put(tv("Settings", 30f, t.text, true), 8)
-        col.put(card(sec("YOUR CODE"), mine, row(copy, share), tv("Send this to your partner so they can paste it into their app.", 13f, t.sub)), 18)
+        tScroll.isHorizontalScrollBarEnabled = false; tScroll.addView(themeRow)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(16)) }
+        col.put(tv("Settings", 30f, t.text, true), 0)
+        col.put(card(sec("YOUR CODE"), mine, row(copy, share), tv("Send this to your partner so they can paste it into their app.", 13f, t.sub)), 16)
         col.put(card(sec("PARTNER'S CODE"), theirs, tv("Paste the code your partner sent you.", 13f, t.sub)), 14)
         col.put(card(sec("ALARM MUSIC"), musicLbl, row(pick, reset)), 14)
+        col.put(card(sec("STOP ALARM WITH AN APP"),
+            sw("Alarm only stops when I open an app", p.getBoolean("stop_app", false)) { v -> p.edit().putBoolean("stop_app", v).apply() },
+            stopLbl,
+            row(btn("Choose app", true) { pickApp() }, btn("Usage access", false) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }),
+            tv("Usage access lets the app notice you opened it. Without it, the alarm stops when you tap the Open button.", 12f, t.sub)), 14)
         col.put(card(sec("BACKGROUND RUNNING"), tv("Lets wake-ups arrive while the app is closed.", 13f, t.sub), bg), 14)
-        col.put(card(sec("THEME"), themeScroll), 14)
-        col.put(card(sec("STYLE"), styleScroll), 14)
-        scroll.addView(col)
-        val y = keepY; keepY = 0
-        if (y > 0) scroll.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
-            override fun onGlobalLayout() { scroll.viewTreeObserver.removeOnGlobalLayoutListener(this); scroll.scrollTo(0, y) }
+        col.put(card(sec("THEME"), tScroll), 14)
+        sScroll.addView(col)
+        val y = keepY; val x = keepX; keepY = 0; keepX = 0
+        if (y > 0 || x > 0) sScroll.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                if (sScroll.height == 0) return
+                sScroll.viewTreeObserver.removeOnGlobalLayoutListener(this); sScroll.scrollTo(0, y); tScroll.scrollTo(x, 0)
+            }
         })
-        val root = FrameLayout(this); root.addView(scroll); show(root)
+        return sScroll
     }
 
     override fun onActivityResult(r: Int, c: Int, d: Intent?) {
         super.onActivityResult(r, c, d)
         val u = d?.data ?: return
-        if (r == 7 && c == RESULT_OK) {
+        if (c != RESULT_OK) return
+        if (r == 7) {
             try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
             Core.prefs(this).edit().putString("tone", u.toString()).apply(); musicLbl.text = "Custom music selected"
-        }
+        } else if (r == 8) { img = u; preview.setImageURI(u); preview.visibility = View.VISIBLE }
     }
 }
