@@ -70,14 +70,15 @@ val THEMES = listOf(
 
 // ---------- Core ----------
 object Core {
-    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "quiet"
+    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"
     val ICON = R.drawable.ic_alarm
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
 
     fun channels(c: Context) {
         val nm = c.getSystemService(NotificationManager::class.java)
         try { nm.deleteNotificationChannel("svc") } catch (e: Exception) {}
-        nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_NONE))
+        try { nm.deleteNotificationChannel("quiet") } catch (e: Exception) {}
+        nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_MIN))
         nm.createNotificationChannel(NotificationChannel(CH_INFO, "Messages", NotificationManager.IMPORTANCE_HIGH))
         val a = NotificationChannel(CH_ALARM, "Wake-up alarm", NotificationManager.IMPORTANCE_HIGH)
         a.setSound(null, null); a.setBypassDnd(true)
@@ -382,13 +383,16 @@ class WakeTile : TileService() {
 
 // ---------- Listener service ----------
 class ListenService : Service() {
+    companion object { @Volatile var running = false }
     private var started = false
+    override fun onDestroy() { running = false; super.onDestroy() }
     override fun onBind(i: Intent?): IBinder? = null
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
         Core.channels(this)
-        val n = Notification.Builder(this, Core.CH_SVC).setSmallIcon(Core.ICON).setContentTitle("WakeUp").build()
+        val n = Notification.Builder(this, Core.CH_SVC).setSmallIcon(Core.ICON).setContentTitle("WakeUp").setShowWhen(false).setVisibility(Notification.VISIBILITY_SECRET).build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(1, n)
+        running = true
         if (!started) { started = true; Thread { loop() }.start() }
         return START_STICKY
     }
@@ -779,7 +783,7 @@ class MainActivity : Base() {
         root.addView(col, FrameLayout.LayoutParams(-1, -1))
         show(root)
         keepPage = 2
-        startForegroundService(Intent(this, ListenService::class.java))
+        if (!ListenService.running) startForegroundService(Intent(this, ListenService::class.java))
     }
 
     // ----- tab 0: drawing pad -----
