@@ -70,9 +70,12 @@ val THEMES = listOf(
 
 // ---------- Core ----------
 object Core {
-    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"
+    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"
     val ICON = R.drawable.ic_alarm
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
+    private val waiters = HashMap<String, (Boolean) -> Unit>()
+    fun rid(): String = (1..8).map { "abcdefghijklmnopqrstuvwxyz0123456789".random() }.joinToString("")
+    fun dndOn(c: Context): Boolean = System.currentTimeMillis() < prefs(c).getLong("dnd_until", 0L)
 
     fun channels(c: Context) {
         val nm = c.getSystemService(NotificationManager::class.java)
@@ -80,6 +83,8 @@ object Core {
         try { nm.deleteNotificationChannel("quiet") } catch (e: Exception) {}
         nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_MIN))
         nm.createNotificationChannel(NotificationChannel(CH_INFO, "Messages", NotificationManager.IMPORTANCE_HIGH))
+        val po = NotificationChannel(CH_POLITE, "Are you awake?", NotificationManager.IMPORTANCE_HIGH)
+        po.setBypassDnd(true); nm.createNotificationChannel(po)
         val a = NotificationChannel(CH_ALARM, "Wake-up alarm", NotificationManager.IMPORTANCE_HIGH)
         a.setSound(null, null); a.setBypassDnd(true)
         nm.createNotificationChannel(a)
@@ -96,26 +101,38 @@ object Core {
         return Pair(code == 200, txt)
     }
 
-    fun postJson(c: Context, o: JSONObject, done: ((Boolean) -> Unit)? = null) {
+    fun postJson(c: Context, o: JSONObject, done: ((Boolean) -> Unit)? = null, track: Boolean = true): String {
+        if (!o.has("id")) o.put("id", rid())
+        val id = o.getString("id")
         val t = prefs(c).getString("theirs", "")!!.trim()
-        if (t.isEmpty()) { done?.invoke(false); return }
+        if (t.isEmpty()) { done?.invoke(false); return id }
         Thread {
             var ok = false
+            if (track) log(c, 0, describe(o), id, 0)
             try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) {}
-            log(c, 0, describe(o) + if (ok) "" else " (failed)")
+            if (track && !ok) mark(c, id, 2)
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
+        return id
+    }
+    fun send(c: Context, type: String, done: ((Boolean) -> Unit)? = null): String = postJson(c, JSONObject().put("t", type), done)
+
+    fun watch(id: String, cb: (Boolean) -> Unit) { synchronized(waiters) { waiters[id] = cb } }
+    fun delivered(c: Context, id: String, dnd: Boolean) {
+        mark(c, id, if (dnd) 3 else 1)
+        val cb = synchronized(waiters) { waiters.remove(id) }
+        if (cb != null) Handler(Looper.getMainLooper()).post { cb(dnd) }
     }
 
-    fun send(c: Context, type: String, done: ((Boolean) -> Unit)? = null) = postJson(c, JSONObject().put("t", type), done)
-
-    fun sendCustom(c: Context, title: String, body: String, img: Uri?, done: (Boolean) -> Unit) {
+    fun sendCustom(c: Context, title: String, body: String, img: Uri?, done: (Boolean) -> Unit): String {
+        val o = JSONObject().put("t", "msg").put("title", title).put("body", body).put("id", rid())
+        if (img != null) o.put("photo", true)
+        val id = o.getString("id")
         val t = prefs(c).getString("theirs", "")!!.trim()
-        if (t.isEmpty()) { done(false); return }
+        if (t.isEmpty()) { done(false); return id }
         Thread {
             var ok = false
-            val o = JSONObject().put("t", "msg").put("title", title).put("body", body)
-            if (img != null) o.put("photo", true)
+            log(c, 0, describe(o), id, 0)
             try {
                 if (img != null) {
                     val opt = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -130,9 +147,49 @@ object Core {
                 }
                 ok = rawPost(t, o.toString().toByteArray()).first
             } catch (e: Exception) {}
-            log(c, 0, describe(o) + if (ok) "" else " (failed)")
+            if (!ok) mark(c, id, 2)
             Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
+        return id
+    }
+
+    fun sendBoard(c: Context, bmp: Bitmap, done: (Boolean) -> Unit): String {
+        val id = rid()
+        val t = prefs(c).getString("theirs", "")!!.trim()
+        if (t.isEmpty()) { done(false); return id }
+        Thread {
+            var ok = false
+            log(c, 0, "Drawing synced", id, 0)
+            try {
+                val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
+                val r = rawPost(t, bos.toByteArray(), true, "board.png")
+                if (r.first) {
+                    val o = JSONObject().put("t", "board").put("id", id).put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
+                    ok = rawPost(t, o.toString().toByteArray()).first
+                }
+            } catch (e: Exception) {}
+            if (!ok) mark(c, id, 2)
+            Handler(Looper.getMainLooper()).post { done(ok) }
+        }.start()
+        return id
+    }
+
+    fun info(c: Context, title: String, text: String) {
+        val pi = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val n = Notification.Builder(c, CH_INFO).setSmallIcon(ICON).setContentTitle(title).setContentText(text)
+            .setContentIntent(pi).setAutoCancel(true).build()
+        c.getSystemService(NotificationManager::class.java).notify((System.currentTimeMillis() % 100000).toInt() + 10, n)
+    }
+
+    fun withReply(c: Context, ch: String, title: String, text: String, label: String, reply: String) {
+        val nid = (System.currentTimeMillis() % 100000).toInt() + 10
+        val pi = PendingIntent.getBroadcast(c, nid, Intent(c, ReplyReceiver::class.java).putExtra("r", reply).putExtra("n", nid),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val n = Notification.Builder(c, ch).setSmallIcon(ICON).setContentTitle(title).setContentText(text)
+            .setContentIntent(open).setAutoCancel(true)
+            .addAction(Notification.Action.Builder(Icon.createWithResource(c, ICON), label, pi).build()).build()
+        c.getSystemService(NotificationManager::class.java).notify(nid, n)
     }
 
     fun custom(c: Context, title: String, body: String, bmp: Bitmap?) {
@@ -144,13 +201,6 @@ object Core {
         c.getSystemService(NotificationManager::class.java).notify((System.currentTimeMillis() % 100000).toInt() + 10, b.build())
     }
 
-    fun info(c: Context, title: String, text: String) {
-        val pi = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val n = Notification.Builder(c, CH_INFO).setSmallIcon(ICON).setContentTitle(title).setContentText(text)
-            .setContentIntent(pi).setAutoCancel(true).build()
-        c.getSystemService(NotificationManager::class.java).notify((System.currentTimeMillis() % 100000).toInt() + 10, n)
-    }
-
     fun ring(c: Context) {
         val i = Intent(c, AlarmActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val pi = PendingIntent.getActivity(c, 1, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -160,22 +210,37 @@ object Core {
         try { c.startActivity(i) } catch (e: Exception) {}
     }
 
-    @Synchronized fun log(c: Context, kind: Int, text: String) {
+    // st: 0 sent, 1 delivered, 2 failed, 3 delivered (their DND on), 4 received but muted
+    @Synchronized fun log(c: Context, kind: Int, text: String, id: String = "", st: Int = 0) {
         try {
             val p = prefs(c)
             val old = JSONArray(p.getString("hist", "[]"))
             val n = JSONArray()
-            n.put(JSONObject().put("k", kind).put("x", text).put("t", System.currentTimeMillis()))
+            n.put(JSONObject().put("k", kind).put("x", text).put("t", System.currentTimeMillis()).put("i", id).put("s", st))
             var i = 0
-            while (i < old.length() && n.length() < 150) { n.put(old.get(i)); i++ }
+            while (i < old.length() && n.length() < 300) { n.put(old.get(i)); i++ }
             p.edit().putString("hist", n.toString()).apply()
         } catch (e: Exception) {}
+        Backup.save(c)
+        Handler(Looper.getMainLooper()).post { Hooks.onLog?.invoke() }
+    }
+    @Synchronized fun mark(c: Context, id: String, st: Int) {
+        try {
+            val p = prefs(c)
+            val a = JSONArray(p.getString("hist", "[]"))
+            for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("i") == id) o.put("s", st) }
+            p.edit().putString("hist", a.toString()).apply()
+        } catch (e: Exception) {}
+        Backup.save(c)
         Handler(Looper.getMainLooper()).post { Hooks.onLog?.invoke() }
     }
 
     fun describe(o: JSONObject): String = when (o.optString("t")) {
         "wake" -> "Wake-up"
         "polite" -> "Are you awake?"
+        "meow" -> "Nyaaa"
+        "yesh" -> "Replied: Yesh"
+        "meowr" -> "Replied: Meowww"
         "ack" -> "Confirmed they're up"
         "late" -> "Not up yet notice"
         "board" -> "Drawing synced"
@@ -186,56 +251,19 @@ object Core {
         else -> o.optString("t")
     }
 
-    fun appMode(c: Context): Boolean = prefs(c).getBoolean("stop_app", false) && !prefs(c).getString("stop_pkg", "").isNullOrEmpty()
-
-    fun hasUsage(c: Context): Boolean = try {
-        c.getSystemService(AppOpsManager::class.java).checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.packageName) == AppOpsManager.MODE_ALLOWED
-    } catch (e: Exception) { false }
-
-    fun finishWake(c: Context) {
-        Alarm.stop(c)
-        prefs(c).edit().putInt("snz", 0).putBoolean("pend", false).apply()
-        try { c.getSystemService(AlarmManager::class.java).cancel(snoozePi(c)) } catch (e: Exception) {}
-        cancelAt(c, 5); log(c, 2, "You're up"); send(c, "ack")
-    }
-
-    fun sendBoard(c: Context, bmp: Bitmap, done: (Boolean) -> Unit) {
-        val t = prefs(c).getString("theirs", "")!!.trim()
-        if (t.isEmpty()) { done(false); return }
-        Thread {
-            var ok = false
-            try {
-                val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
-                val r = rawPost(t, bos.toByteArray(), true, "board.png")
-                if (r.first) {
-                    val o = JSONObject().put("t", "board").put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
-                    ok = rawPost(t, o.toString().toByteArray()).first
-                }
-            } catch (e: Exception) {}
-            log(c, 0, "Drawing synced" + if (ok) "" else " (failed)")
-            Handler(Looper.getMainLooper()).post { done(ok) }
-        }.start()
-    }
-
     fun freshWake(c: Context) {
         val p = prefs(c)
         if (System.currentTimeMillis() > p.getLong("snzu", 0L)) p.edit().putInt("snz", 0).apply()
     }
-
     private fun schedPi(c: Context, code: Int, k: String) = PendingIntent.getBroadcast(c, code,
         Intent(c, SchedReceiver::class.java).putExtra("k", k), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-
     fun setAt(c: Context, t: Long, code: Int, k: String) {
         try {
             val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
             c.getSystemService(AlarmManager::class.java).setAlarmClock(AlarmManager.AlarmClockInfo(t, open), schedPi(c, code, k))
         } catch (e: Exception) {}
     }
-
-    fun cancelAt(c: Context, code: Int) {
-        try { c.getSystemService(AlarmManager::class.java).cancel(schedPi(c, code, "x")) } catch (e: Exception) {}
-    }
-
+    fun cancelAt(c: Context, code: Int) { try { c.getSystemService(AlarmManager::class.java).cancel(schedPi(c, code, "x")) } catch (e: Exception) {} }
     fun scheduleNext(c: Context) {
         try {
             val p = prefs(c)
@@ -246,6 +274,16 @@ object Core {
             if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
             setAt(c, cal.timeInMillis, 4, "ring")
         } catch (e: Exception) {}
+    }
+    fun appMode(c: Context): Boolean = prefs(c).getBoolean("stop_app", false) && !prefs(c).getString("stop_pkg", "").isNullOrEmpty()
+    fun hasUsage(c: Context): Boolean = try {
+        c.getSystemService(AppOpsManager::class.java).checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.packageName) == AppOpsManager.MODE_ALLOWED
+    } catch (e: Exception) { false }
+    fun finishWake(c: Context) {
+        Alarm.stop(c)
+        prefs(c).edit().putInt("snz", 0).putBoolean("pend", false).apply()
+        try { c.getSystemService(AlarmManager::class.java).cancel(snoozePi(c)) } catch (e: Exception) {}
+        cancelAt(c, 5); log(c, 2, "You're up"); send(c, "ack")
     }
 }
 
@@ -397,33 +435,43 @@ class ListenService : Service() {
         return START_STICKY
     }
 
-    private fun handle(m: JSONObject) {
+    private fun handle(m: JSONObject, age: Long) {
         val t = m.optString("t")
-        Core.log(this, 1, Core.describe(m))
+        if (t == "dlv") { Core.delivered(this, m.optString("ref"), m.optBoolean("dnd")); return }
+        val dnd = Core.dndOn(this)
+        val id = m.optString("id")
+        if (id.isNotEmpty()) Core.postJson(this, JSONObject().put("t", "dlv").put("ref", id).put("dnd", dnd), null, false)
+        Core.log(this, 1, Core.describe(m) + (if (age > 600 && t == "wake") " (arrived late)" else ""), "", if (dnd && t != "board") 4 else 0)
+        val ui = Handler(Looper.getMainLooper())
         if (t == "board") {
             Thread {
                 try {
                     val bmp = URL(m.optString("img")).openStream().use { BitmapFactory.decodeStream(it) }
                     if (bmp != null) {
                         Board.store(this, bmp)
-                        Handler(Looper.getMainLooper()).post { Board.view?.reload(); Core.info(this, "Drawing updated", "Your partner saved a new drawing") }
+                        ui.post { Board.view?.reload(); if (!dnd) Core.info(this, "Drawing updated", "Your partner saved a new drawing") }
                     }
                 } catch (e: Exception) {}
             }.start()
             return
         }
+        if (dnd) return
         if (t == "msg") {
             Thread {
                 var bmp: Bitmap? = null
                 try { val u = m.optString("img"); if (u.isNotEmpty()) bmp = URL(u).openStream().use { BitmapFactory.decodeStream(it) } } catch (e: Exception) {}
-                Handler(Looper.getMainLooper()).post { Core.custom(this, m.optString("title"), m.optString("body"), bmp) }
+                ui.post { Core.custom(this, m.optString("title"), m.optString("body"), bmp) }
             }.start()
             return
         }
-        Handler(Looper.getMainLooper()).post {
+        ui.post {
             when (t) {
-                "wake" -> { Core.freshWake(this); Alarm.start(this) }
-                "polite" -> Core.info(this, "Are you awake?", "Your partner is checking on you")
+                "wake" -> if (age > 600) Core.info(this, "Missed wake-up", "A wake-up arrived ${age / 60} min late, so the alarm was skipped")
+                          else { Core.freshWake(this); Alarm.start(this) }
+                "polite" -> Core.withReply(this, Core.CH_POLITE, "Are you awake?", "Your partner is checking on you", "Yesh", "yesh")
+                "meow" -> Core.withReply(this, Core.CH_INFO, "Nyaaa", "Your partner says nyaaa", "Meowww", "meowr")
+                "yesh" -> Core.info(this, "Yesh", "They're awake")
+                "meowr" -> Core.info(this, "Meowww", "Your partner meowed back")
                 "ack" -> Core.info(this, "They're up", "Your partner confirmed they're awake")
                 "late" -> Core.info(this, "Still asleep", "They haven't confirmed they're up. Tap to wake them!")
             }
@@ -437,11 +485,12 @@ class ListenService : Service() {
             if (topic.isEmpty()) { Thread.sleep(5000); continue }
             try {
                 val last = p.getLong("lastT", 0L)
-                val since = if (last > 0) last else System.currentTimeMillis() / 1000
+                val since = if (last > 0) last else System.currentTimeMillis() / 1000 - 7200
                 val h = URL("https://ntfy.sh/$topic/json?since=$since").openConnection() as HttpURLConnection
                 h.readTimeout = 120000
                 h.inputStream.bufferedReader().forEachLine { line ->
                     if (Core.prefs(this).getString("mine", "") != topic) throw RuntimeException("code changed")
+                    p.edit().putLong("hb", System.currentTimeMillis()).apply()
                     try {
                         val o = JSONObject(line)
                         if (o.optString("event") == "message") {
@@ -449,7 +498,8 @@ class ListenService : Service() {
                             val lt = p.getLong("lastT", 0L)
                             if (tm > lt || (tm == lt && id != p.getString("lastId", ""))) {
                                 p.edit().putLong("lastT", tm).putString("lastId", id).apply()
-                                if (System.currentTimeMillis() / 1000 - tm < 90) handle(JSONObject(o.getString("message")))
+                                val age = System.currentTimeMillis() / 1000 - tm
+                                if (age < 21600) handle(JSONObject(o.getString("message")), age)
                             }
                         }
                     } catch (e: Exception) {}
@@ -458,6 +508,63 @@ class ListenService : Service() {
             Thread.sleep(5000)
         }
     }
+}
+
+class ReplyReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        val r = i.getStringExtra("r") ?: return
+        val pr = goAsync()
+        try { c.getSystemService(NotificationManager::class.java).cancel(i.getIntExtra("n", 0)) } catch (e: Exception) {}
+        Core.send(c, r) { pr.finish() }
+    }
+}
+
+object Backup {
+    private val SKIP = setOf("lastT", "lastId", "hb", "snz", "snzu", "pend", "dnd_until", "bk_ok")
+    private fun dir(): java.io.File? = try {
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) null
+        else java.io.File(Environment.getExternalStorageDirectory(), "WakeUp").also { it.mkdirs() }
+    } catch (e: Exception) { null }
+    fun available(): Boolean = dir() != null
+    fun hasFile(): Boolean = dir()?.let { java.io.File(it, "backup.json").exists() } ?: false
+
+    @Synchronized fun save(c: Context) {
+        val d = dir() ?: return
+        val p = Core.prefs(c)
+        if (p.getString("mine", "").isNullOrEmpty()) return
+        val f = java.io.File(d, "backup.json")
+        if (f.exists() && !p.getBoolean("bk_ok", false)) return
+        try {
+            val o = JSONObject()
+            for ((k, v) in p.all) {
+                if (k in SKIP) continue
+                when (v) {
+                    is String -> o.put(k, JSONArray().put("s").put(v))
+                    is Boolean -> o.put(k, JSONArray().put("b").put(v))
+                    is Int -> o.put(k, JSONArray().put("i").put(v))
+                    is Long -> o.put(k, JSONArray().put("l").put(v))
+                }
+            }
+            f.writeText(o.toString())
+            val bf = Board.file(c); if (bf.exists()) bf.copyTo(java.io.File(d, "board.png"), true)
+            if (!p.getBoolean("bk_ok", false)) p.edit().putBoolean("bk_ok", true).apply()
+        } catch (e: Exception) {}
+    }
+    fun restore(c: Context): Boolean {
+        val d = dir() ?: return false
+        val f = java.io.File(d, "backup.json"); if (!f.exists()) return false
+        return try {
+            val o = JSONObject(f.readText()); val e = Core.prefs(c).edit()
+            for (k in o.keys()) {
+                val a = o.getJSONArray(k)
+                when (a.getString(0)) { "s" -> e.putString(k, a.getString(1)); "b" -> e.putBoolean(k, a.getBoolean(1)); "i" -> e.putInt(k, a.getInt(1)); "l" -> e.putLong(k, a.getLong(1)) }
+            }
+            e.putBoolean("bk_ok", true).apply()
+            val bf = java.io.File(d, "board.png"); if (bf.exists()) bf.copyTo(Board.file(c), true)
+            true
+        } catch (e: Exception) { false }
+    }
+    fun restoreIfFresh(c: Context) { if (Core.prefs(c).getString("mine", "").isNullOrEmpty()) restore(c) }
 }
 
 // ---------- Hooks / Board ----------
@@ -483,48 +590,98 @@ object Board {
     }
 }
 
+class Stroke(val color: Int, val size: Float, val eraser: Boolean, val clear: Boolean = false) { val pts = ArrayList<Float>() }
+
 class DrawView(private val c: Context) : View(c) {
     private val bmp = Board.load(c)
     private val cv = Canvas(bmp)
+    private var base: Bitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
+    private val strokes = ArrayList<Stroke>()
+    private var cur: Stroke? = null
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
     private val path = Path()
     private val m = Matrix()
     private val inv = Matrix()
-    private val undo = ArrayList<Bitmap>()
     var color = Color.parseColor("#111111")
     var eraser = false
     var size = 14f
     private var lx = 0f; private var ly = 0f; private var mx = 0f; private var my = 0f
 
+    override fun onLayout(ch: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(ch, l, t, r, b)
+        if (Build.VERSION.SDK_INT >= 29) systemGestureExclusionRects = listOf(Rect(0, 0, r - l, b - t))
+    }
     override fun onDraw(canvas: Canvas) {
         val s = minOf(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
         m.reset(); m.postScale(s, s); m.postTranslate((width - bmp.width * s) / 2, (height - bmp.height * s) / 2); m.invert(inv)
         canvas.drawBitmap(bmp, m, null)
     }
-    private fun push() {
-        bmp.copy(Bitmap.Config.ARGB_8888, false)?.let { undo.add(it) }
-        if (undo.size > 6) undo.removeAt(0).recycle()
+    private fun setup(s: Stroke) { paint.color = if (s.eraser) PAPER else s.color; paint.strokeWidth = s.size }
+    private fun render(s: Stroke) {
+        if (s.clear) { cv.drawColor(PAPER); return }
+        setup(s)
+        val p = s.pts
+        if (p.size < 2) return
+        if (p.size == 2) { cv.drawPoint(p[0], p[1], paint); return }
+        path.reset(); path.moveTo(p[0], p[1])
+        var px = p[0]; var py = p[1]; var i = 2
+        while (i < p.size) { val x = p[i]; val y = p[i + 1]; path.quadTo(px, py, (x + px) / 2, (y + py) / 2); px = x; py = y; i += 2 }
+        path.lineTo(px, py); cv.drawPath(path, paint)
     }
     override fun onTouchEvent(e: MotionEvent): Boolean {
         parent.requestDisallowInterceptTouchEvent(true)
         val pt = floatArrayOf(e.x, e.y); inv.mapPoints(pt)
-        paint.color = if (eraser) PAPER else color; paint.strokeWidth = size
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { push(); lx = pt[0]; ly = pt[1]; mx = lx; my = ly; cv.drawPoint(lx, ly, paint) }
-            MotionEvent.ACTION_MOVE -> {
+            MotionEvent.ACTION_DOWN -> {
+                val s = Stroke(color, size, eraser); s.pts.add(pt[0]); s.pts.add(pt[1]); cur = s; setup(s)
+                lx = pt[0]; ly = pt[1]; mx = lx; my = ly; cv.drawPoint(lx, ly, paint)
+            }
+            MotionEvent.ACTION_MOVE -> cur?.let { s ->
+                s.pts.add(pt[0]); s.pts.add(pt[1]); setup(s)
                 val midx = (pt[0] + lx) / 2; val midy = (pt[1] + ly) / 2
                 path.reset(); path.moveTo(mx, my); path.quadTo(lx, ly, midx, midy); cv.drawPath(path, paint)
                 mx = midx; my = midy; lx = pt[0]; ly = pt[1]
             }
-            MotionEvent.ACTION_UP -> { path.reset(); path.moveTo(mx, my); path.lineTo(lx, ly); cv.drawPath(path, paint) }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cur?.let { s ->
+                setup(s); path.reset(); path.moveTo(mx, my); path.lineTo(lx, ly); cv.drawPath(path, paint)
+                strokes.add(s); cur = null
+                if (strokes.size > 1500) { base.recycle(); base = bmp.copy(Bitmap.Config.ARGB_8888, false); strokes.clear() }
+            }
         }
         invalidate(); return true
     }
-    fun undo() { if (undo.isNotEmpty()) { val b = undo.removeAt(undo.size - 1); cv.drawBitmap(b, 0f, 0f, null); b.recycle(); invalidate() } }
-    fun clear() { push(); cv.drawColor(PAPER); invalidate() }
-    fun reload() { cv.drawBitmap(Board.load(c), 0f, 0f, null); invalidate() }
+    fun undo() {
+        if (strokes.isEmpty()) return
+        strokes.removeAt(strokes.size - 1)
+        cv.drawBitmap(base, 0f, 0f, null)
+        for (s in strokes) render(s)
+        invalidate()
+    }
+    fun clear() { strokes.add(Stroke(0, 0f, false, true)); cv.drawColor(PAPER); invalidate() }
+    fun reload() { base.recycle(); base = Board.load(c); strokes.clear(); cv.drawBitmap(base, 0f, 0f, null); invalidate() }
     fun saveLocal() = Board.store(c, bmp)
     fun snapshot(): Bitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
+}
+
+class Sq(c: Context) : View(c) {
+    override fun onMeasure(w: Int, h: Int) { val s = MeasureSpec.getSize(w); setMeasuredDimension(s, s) }
+}
+
+class AspectFrame(c: Context) : FrameLayout(c) {
+    override fun onMeasure(w: Int, h: Int) {
+        val aw = MeasureSpec.getSize(w); val ah = MeasureSpec.getSize(h)
+        val r = Board.W.toFloat() / Board.H
+        var tw = aw; var th = (aw / r).toInt()
+        if (th > ah) { th = ah; tw = (ah * r).toInt() }
+        super.onMeasure(MeasureSpec.makeMeasureSpec(tw, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(th, MeasureSpec.EXACTLY))
+    }
+}
+
+class HScroll(c: Context) : HorizontalScrollView(c) {
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) parent?.requestDisallowInterceptTouchEvent(true)
+        return super.dispatchTouchEvent(ev)
+    }
 }
 
 // ---------- Swipe pager ----------
@@ -726,6 +883,9 @@ class MainActivity : Base() {
     private lateinit var theirs: EditText
     private lateinit var musicLbl: TextView
     private lateinit var stopLbl: TextView
+    private lateinit var connLbl: TextView
+    private lateinit var bkLbl: TextView
+    private lateinit var dndBtn: Button
     private lateinit var tField: EditText
     private lateinit var bField: EditText
     private lateinit var preview: ImageView
@@ -733,13 +893,16 @@ class MainActivity : Base() {
     private lateinit var nStatus: TextView
     private var img: Uri? = null
     private val argb = ArgbEvaluator()
+    private val ui = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable { override fun run() { refreshDnd(); updateConn(); ui.postDelayed(this, 15000) } }
 
     private fun saveGrace() { Core.prefs(this).edit().putInt("grace", grace.text.toString().toIntOrNull()?.coerceIn(1, 180) ?: 15).apply() }
     private fun saveCodes() {
         Core.prefs(this).edit().putString("mine", mine.text.toString().trim()).putString("theirs", theirs.text.toString().trim()).apply()
     }
-    override fun onPause() { saveGrace(); saveCodes(); draw.saveLocal(); super.onPause() }
-    override fun onDestroy() { Hooks.onLog = null; Board.view = null; super.onDestroy() }
+    override fun onPause() { saveGrace(); saveCodes(); draw.saveLocal(); Backup.save(this); super.onPause() }
+    override fun onDestroy() { Hooks.onLog = null; Board.view = null; ui.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun onResume() { super.onResume(); refreshDnd(); updateConn(); if (::bkLbl.isInitialized) bkLbl.text = backupText() }
 
     private fun updateTabs(tabs: List<ImageView>, pos: Float) {
         tabs.forEachIndexed { i, v ->
@@ -752,6 +915,7 @@ class MainActivity : Base() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        Backup.restoreIfFresh(this)
         Core.channels(this)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
         val p = Core.prefs(this)
@@ -784,12 +948,22 @@ class MainActivity : Base() {
         show(root)
         keepPage = 2
         if (!ListenService.running) startForegroundService(Intent(this, ListenService::class.java))
+        ui.post(tick)
+    }
+
+    // ----- shared: "Sent" then "Delivered" -----
+    private fun track(status: TextView, id: String) {
+        Core.watch(id) { dnd -> status.text = if (dnd) "Delivered (their DND is on)" else "Delivered" }
+    }
+    private fun sentText(status: TextView) {
+        status.text = "Sent"
+        status.postDelayed({ if (status.text == "Sent") status.text = "Sent. Not delivered yet" }, 15000)
     }
 
     // ----- tab 0: drawing pad -----
     private fun drawPage(): View {
         draw = DrawView(this); Board.view = draw
-        val frame = FrameLayout(this).apply { background = shape(PAPER, dp(20)); clipToOutline = true; addView(draw, FrameLayout.LayoutParams(-1, -1)) }
+        val frame = AspectFrame(this).apply { background = shape(PAPER, dp(20)); clipToOutline = true; addView(draw, FrameLayout.LayoutParams(-1, -1)) }
         val status = tv("", 13f, t.sub).apply { gravity = Gravity.CENTER }
         val colors = listOf("#111111", "#FFFFFF", "#E53935", "#FB8C00", "#FDD835", "#43A047", "#1E88E5", "#8E24AA")
         val dots = ArrayList<View>()
@@ -803,9 +977,9 @@ class MainActivity : Base() {
         }
         val dotRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         colors.forEach { cs ->
-            val v = View(this); dots.add(v)
+            val v = Sq(this); dots.add(v)
             v.setOnClickListener { draw.color = Color.parseColor(cs); draw.eraser = false; refresh() }
-            dotRow.addView(v, LinearLayout.LayoutParams(0, dpi(34), 1f).apply { setMargins(dpi(3), 0, dpi(3), 0) })
+            dotRow.addView(v, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dpi(3), 0, dpi(3), 0) })
         }
         eraseBtn.setOnClickListener { draw.eraser = !draw.eraser; refresh() }
         refresh()
@@ -825,11 +999,15 @@ class MainActivity : Base() {
         val save = btn("Save & sync", true) {
             draw.saveLocal()
             if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) status.text = "Saved here. Add your partner's code in Settings to sync."
-            else { status.text = "Syncing..."; Core.sendBoard(this, draw.snapshot()) { ok -> status.text = if (ok) "Synced" else "Couldn't sync. Check your connection" } }
+            else {
+                status.text = "Sending..."
+                val id = Core.sendBoard(this, draw.snapshot()) { ok -> if (ok) sentText(status) else status.text = "Couldn't send. Check your connection" }
+                track(status, id)
+            }
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(8)) }
         col.put(dotRow, 0); col.put(tools, 10); col.put(seek, 4)
-        col.addView(frame, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dpi(6) })
+        col.addView(frame, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dpi(6); gravity = Gravity.CENTER_HORIZONTAL })
         col.put(status, 6); col.put(save, 6)
         return col
     }
@@ -853,6 +1031,7 @@ class MainActivity : Base() {
         }
     }
     private fun notifyPage(): View {
+        val p = Core.prefs(this)
         nStatus = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
         tField = field("Title", "").apply { id = 1001 }
         bField = field("Message", "").apply {
@@ -862,13 +1041,20 @@ class MainActivity : Base() {
         preview = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; visibility = View.GONE }
         val add = btn("Add photo", false) { startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 8) }
         val rem = btn("Remove photo", false) { img = null; preview.visibility = View.GONE }
+        val clearSw = sw("Clear boxes after sending", p.getBoolean("clear_after", false)) { v -> p.edit().putBoolean("clear_after", v).apply() }
         val send = btn("Send", true) {
             val ti = tField.text.toString().trim(); val bo = bField.text.toString().trim()
-            if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) nStatus.text = "Add your partner's code in Settings"
+            if (p.getString("theirs", "").isNullOrBlank()) nStatus.text = "Add your partner's code in Settings"
             else if (ti.isEmpty() && bo.isEmpty() && img == null) nStatus.text = "Write something or add a photo first"
             else {
                 nStatus.text = "Sending..."
-                Core.sendCustom(this, ti, bo, img) { ok -> nStatus.text = if (ok) "Sent" else "Couldn't send. Check your connection" }
+                val id = Core.sendCustom(this, ti, bo, img) { ok ->
+                    if (ok) {
+                        sentText(nStatus)
+                        if (p.getBoolean("clear_after", false)) { tField.setText(""); bField.setText(""); img = null; preview.visibility = View.GONE }
+                    } else nStatus.text = "Couldn't send. Check your connection"
+                }
+                track(nStatus, id)
             }
         }
         val save = btn("Save template", false) {
@@ -876,13 +1062,13 @@ class MainActivity : Base() {
             if (ti.isEmpty() && bo.isEmpty()) nStatus.text = "Nothing to save yet"
             else {
                 val a = tpls(); a.put(JSONObject().put("title", ti).put("body", bo))
-                Core.prefs(this).edit().putString("tpl", a.toString()).apply(); renderTpl(); nStatus.text = "Template saved"
+                p.edit().putString("tpl", a.toString()).apply(); renderTpl(); nStatus.text = "Template saved"
             }
         }
         tplBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(16)) }
         col.put(tv("Custom notification", 28f, t.text, true), 0)
-        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), nStatus, send, save), 16)
+        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), clearSw, nStatus, send, save), 16)
         preview.layoutParams = (preview.layoutParams as LinearLayout.LayoutParams).apply { height = dpi(180) }
         col.put(card(sec("TEMPLATES"), tplBox), 14)
         col.put(tv("Photos are sent through ntfy.sh and stay available for about 3 hours. Templates save text only.", 12f, t.sub), 10)
@@ -891,20 +1077,41 @@ class MainActivity : Base() {
     }
 
     // ----- tab 2: wake up alarm -----
+    private fun refreshDnd() {
+        if (!::dndBtn.isInitialized) return
+        val left = Core.prefs(this).getLong("dnd_until", 0L) - System.currentTimeMillis()
+        if (left > 0) {
+            val m = (left + 59999) / 60000
+            dndBtn.text = "DND  ·  " + (if (m >= 60) "%dh %dm".format(m / 60, m % 60) else "%dm".format(m)); dndBtn.setTextColor(t.ac1)
+        } else { dndBtn.text = "DND"; dndBtn.setTextColor(t.text) }
+    }
+    private fun dndDialog() {
+        val p = Core.prefs(this)
+        val labels = arrayListOf("15 minutes", "30 minutes", "1 hour", "2 hours")
+        val mins = intArrayOf(15, 30, 60, 120)
+        if (Core.dndOn(this)) labels.add("Turn off")
+        AlertDialog.Builder(this).setTitle("Mute everything from your partner for").setItems(labels.toTypedArray()) { _, i ->
+            p.edit().putLong("dnd_until", if (i < 4) System.currentTimeMillis() + mins[i] * 60000L else 0L).apply(); refreshDnd()
+        }.show()
+    }
     private fun wakePage(p: SharedPreferences): View {
         val status = tv("", 14f, t.sub).apply { gravity = Gravity.CENTER }
-        fun go(type: String, ok: String) {
+        fun go(type: String) {
             if (p.getString("theirs", "").isNullOrBlank()) { status.text = "Add your partner's code in Settings"; return }
             status.text = "Sending..."
-            Core.send(this, type) { good -> status.text = if (good) ok else "Couldn't send. Check your connection" }
+            val id = Core.send(this, type) { ok -> if (ok) sentText(status) else status.text = "Couldn't send. Check your connection" }
+            track(status, id)
         }
+        dndBtn = mini("DND", false) { dndDialog() }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+        head.addView(dndBtn, LinearLayout.LayoutParams(-2, -2))
         val ringV = View(this).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor((t.ac1 and 0x00FFFFFF) or 0x33000000) } }
         val big = Button(this).apply {
             text = "WAKE UP"; textSize = 26f; isAllCaps = false; stateListAnimator = null
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); letterSpacing = 0.08f; setTextColor(t.btnText)
             background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF),
                 GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(t.ac1, t.ac2)).apply { shape = GradientDrawable.OVAL }, null)
-            setOnClickListener { go("wake", "Wake-up sent") }
+            setOnClickListener { go("wake") }
         }
         val wrap = FrameLayout(this)
         wrap.addView(ringV, FrameLayout.LayoutParams(1, 1, Gravity.CENTER)); wrap.addView(big, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
@@ -930,15 +1137,17 @@ class MainActivity : Base() {
                     p.getInt("sh", 8), p.getInt("sm", 0), true).show()
             } catch (e: Exception) {}
         }
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(24), dpi(40), dpi(24), dpi(8)) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(24), dpi(36), dpi(24), dpi(8)) }
+        col.addView(head, LinearLayout.LayoutParams(-1, -2))
         col.addView(wrap, LinearLayout.LayoutParams(-1, 0, 1f))
         col.put(status, 4)
-        col.put(btn("Are you awake?", false) { go("polite", "Sent") }, 14)
+        col.put(btn("Are you awake?", false) { go("polite") }, 10)
+        col.put(btn("Nyaaa", false) { go("meow") }, 8)
         col.put(card(
             sw("Alarm never stops", p.getBoolean("forever", true)) { v -> p.edit().putBoolean("forever", v).apply() },
             sw("Scheduled wake-up", p.getBoolean("sched_on", false)) { v -> p.edit().putBoolean("sched_on", v).apply(); Core.scheduleNext(this) },
             row(tb, grace, 3f, 1f),
-            tv("Wake-up time, and minutes before notifying my partner", 12f, t.sub)), 16)
+            tv("Wake-up time, and minutes before notifying my partner", 12f, t.sub)), 12)
         return col
     }
 
@@ -959,15 +1168,34 @@ class MainActivity : Base() {
         if (a.length() == 0) { histBox.addView(tv("Nothing yet. Wake-ups, messages and drawings will show up here.", 14f, t.sub)); return }
         val f = java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
         for (i in 0 until a.length()) {
-            val o = a.getJSONObject(i); val k = o.optInt("k")
-            val who = when (k) { 0 -> "SENT"; 1 -> "RECEIVED"; else -> "YOU" }
-            val col = when (k) { 0 -> t.ac1; 1 -> t.ac2; else -> t.sub }
+            val o = a.getJSONObject(i); val k = o.optInt("k"); val st = o.optInt("s")
+            val who = when (k) {
+                0 -> when (st) { 1 -> "DELIVERED"; 3 -> "DELIVERED · THEIR DND ON"; 2 -> "FAILED"; else -> "SENT" }
+                1 -> if (st == 4) "RECEIVED · MUTED BY DND" else "RECEIVED"
+                else -> "YOU"
+            }
+            val col = when (k) { 0 -> if (st == 2) Color.parseColor("#E53935") else t.ac1; 1 -> t.ac2; else -> t.sub }
             histBox.put(card(tv(who + "  ·  " + f.format(java.util.Date(o.optLong("t"))), 12f, col, true), tv(o.optString("x"), 15f)), if (i == 0) 0 else 8)
         }
     }
 
     // ----- tab 4: settings -----
     private fun stopText(p: SharedPreferences): String { val n = p.getString("stop_name", ""); return if (n.isNullOrEmpty()) "No app chosen" else "App: $n" }
+    private fun backupText(): String {
+        val ok = Core.prefs(this).getBoolean("bk_ok", false)
+        return when {
+            !Backup.available() -> "Off. Allow file access so history, codes and settings survive reinstalling the app."
+            Backup.hasFile() && !ok -> "A backup from an earlier install was found. Restore it, or overwrite it with this install."
+            else -> "On. Saved to the WakeUp folder in your phone storage."
+        }
+    }
+    private fun updateConn() {
+        if (!::connLbl.isInitialized) return
+        val hb = Core.prefs(this).getLong("hb", 0L); val age = (System.currentTimeMillis() - hb) / 1000
+        val free = try { getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName) } catch (e: Exception) { false }
+        connLbl.text = (if (hb == 0L) "Listener: no signal yet" else if (age < 120) "Listener: connected" else "Listener: no signal for ${age / 60} min") +
+            "\nBattery: " + (if (free) "unrestricted" else "restricted. Tap Allow background running or wake-ups can arrive late or never.")
+    }
     private fun pickApp() {
         val pm = packageManager
         val ri = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
@@ -980,7 +1208,7 @@ class MainActivity : Base() {
         }.show()
     }
     private fun settingsPage(p: SharedPreferences): View {
-        val sScroll = ScrollView(this); val tScroll = HorizontalScrollView(this)
+        val sScroll = ScrollView(this); val tScroll = HScroll(this)
         mine = field("Your code", p.getString("mine", "")!!).apply { id = 1003 }
         theirs = field("Paste your partner's code", p.getString("theirs", "")!!).apply { id = 1004 }
         for (e in listOf(mine, theirs)) e.onFocusChangeListener = View.OnFocusChangeListener { _, f -> if (!f) saveCodes() }
@@ -989,6 +1217,7 @@ class MainActivity : Base() {
         val share = btn("Share", true) {
             startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, "My WakeUp code: " + mine.text.toString()), null))
         }
+        connLbl = tv("", 13f, t.sub); updateConn()
         musicLbl = tv(if (p.getString("tone", "").isNullOrEmpty()) "Default alarm sound" else "Custom music selected", 14f, t.sub)
         val pick = btn("Choose music", true) {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("audio/*").addCategory(Intent.CATEGORY_OPENABLE)
@@ -999,6 +1228,23 @@ class MainActivity : Base() {
         val bg = btn("Allow background running", true) {
             try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
         }
+        val dndAccess = btn("Allow DND access", true) { try { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) } catch (e: Exception) {} }
+        val chanSet = btn("Notification settings", false) {
+            try {
+                startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName).putExtra(Settings.EXTRA_CHANNEL_ID, Core.CH_POLITE))
+            } catch (e: Exception) {}
+        }
+        bkLbl = tv(backupText(), 13f, t.sub)
+        val files = btn("Allow file access", true) {
+            try { startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
+        }
+        val restore = btn("Restore", false) {
+            AlertDialog.Builder(this).setTitle("Restore backup?").setMessage("This replaces your current codes, history and settings with the backup.")
+                .setPositiveButton("Restore") { _, _ -> if (Backup.restore(this)) { keepPage = 4; recreate() } else bkLbl.text = "No backup found, or file access is off." }
+                .setNegativeButton("Cancel", null).show()
+        }
+        val over = btn("Overwrite backup", false) { p.edit().putBoolean("bk_ok", true).apply(); Backup.save(this); bkLbl.text = backupText() }
+
         val cur = p.getInt("theme", 0).coerceIn(0, THEMES.size - 1)
         val themeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         THEMES.forEachIndexed { i, th ->
@@ -1021,13 +1267,17 @@ class MainActivity : Base() {
         col.put(tv("Settings", 30f, t.text, true), 0)
         col.put(card(sec("YOUR CODE"), mine, row(copy, share), tv("Send this to your partner so they can paste it into their app.", 13f, t.sub)), 16)
         col.put(card(sec("PARTNER'S CODE"), theirs, tv("Paste the code your partner sent you.", 13f, t.sub)), 14)
+        col.put(card(sec("CONNECTION"), connLbl, bg), 14)
         col.put(card(sec("ALARM MUSIC"), musicLbl, row(pick, reset)), 14)
         col.put(card(sec("STOP ALARM WITH AN APP"),
             sw("Alarm only stops when I open an app", p.getBoolean("stop_app", false)) { v -> p.edit().putBoolean("stop_app", v).apply() },
             stopLbl,
             row(btn("Choose app", true) { pickApp() }, btn("Usage access", false) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }),
             tv("Usage access lets the app notice you opened it. Without it, the alarm stops when you tap the Open button.", 12f, t.sub)), 14)
-        col.put(card(sec("BACKGROUND RUNNING"), tv("Lets wake-ups arrive while the app is closed.", 13f, t.sub), bg), 14)
+        col.put(card(sec("AREN'T YOU AWAKE? VS DO NOT DISTURB"),
+            tv("To let \"Are you awake?\" break through your phone's Do Not Disturb: allow DND access, then switch on Override Do Not Disturb for that notification type.", 13f, t.sub),
+            row(dndAccess, chanSet)), 14)
+        col.put(card(sec("BACKUP"), bkLbl, files, row(restore, over)), 14)
         col.put(card(sec("THEME"), tScroll), 14)
         sScroll.addView(col)
         val y = keepY; val x = keepX; keepY = 0; keepX = 0
